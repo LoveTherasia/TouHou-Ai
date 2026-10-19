@@ -3,8 +3,9 @@
 目标：把东方正作的 **replay（`.rpy`）** 变成 `(真实状态, 人类动作)` 数据集，
 用来做行为克隆或离线 RL，缩小 mock→真机的 sim-to-real 差距。
 
-> 状态：**设计阶段**。当前 mock 侧的行为克隆管线（规则老师 → BC → PPO 微调）已跑通，
-> 本方案是把同一条 BC 管线接到 replay 数据上。
+> 状态：**部分落地**。`tools/record_replay.py --bc-out` 已能"让游戏回放 → 逐帧读状态 →
+> 反推真人动作 → 存 npz"；`tools/bc_from_replay.py` 已能直接做行为克隆。
+> 尚未实现的是**直接解析 `.rpy` 文件**（当前绕开了它，改用游戏自带播放器）。
 
 ## 1. 关键事实（决定可行做法）
 
@@ -45,14 +46,16 @@
 - **离线 RL（可选）**：CQL / IQL 等；或先用 BC 预训练，再在真机用 PPO/DAgger 在线微调
   （真机可用 `native/speedhack` 4× 提速）。
 
-## 4. 需要新增的代码
+## 4. 代码现状
 
-| 模块 | 内容 |
+| 位置 | 状态 |
 |---|---|
-| `touhou_rl_mcp/replay/rpy.py` | TH11 `.rpy` 解析 → 逐帧输入表 |
-| `touhou_rl_mcp/replay/collect.py` | 回放 + 逐帧读状态 + 对齐 + 落盘 (npz/jsonl) |
-| `tools/replay_collect.py` | CLI：`--rpy <file> --out <dir>` |
-| `tools/train_from_replay.py` | CLI：BC / 离线 RL 训练入口 |
+| `tools/record_replay.py --bc-out <npz>` | ✅ 播放回放、逐帧读状态、反推动作、落盘 |
+| `tools/bc_from_replay.py --data <npz> --out <dir>` | ✅ BC 训练（含验证集切分） |
+| `touhou_rl_mcp/replay/rpy.py`（解析 `.rpy`） | ⬜ 未实现；当前用游戏播放器绕开 |
+| `touhou_rl_mcp/replay/collect.py` | ⬜ 未抽出为库模块（逻辑仍在 CLI 里） |
+
+> 如果以后要做"不启动游戏的离线解析"，再从第 2 节第 1 步开始补 `.rpy` 解析。
 
 ## 5. 前提与风险
 

@@ -21,6 +21,9 @@
 
 ---
 
+> 项目现状、能力边界与路线图见 [`docs/STATUS.md`](docs/STATUS.md)；
+> 历史会话记录在 [`docs/history/`](docs/history/)。
+
 ## 1. 快速开始
 
 实机观测更新（2026-10-17）：TH11 1.00a 已接入普通弹幕、敌人坐标和擦弹，
@@ -230,7 +233,7 @@ th_train_stop({"save": true})
 
 | 作品 | 状态 |
 |---|---|
-| **th11 东方地灵殿 1.00a** | ✅ 标量：`score` `lives` `power` `stage` `spell_id` `char_main` `char_sub` `graze`<br>✅ 自机坐标、普通弹幕数组、敌人链表，统一场地坐标，版本签名检查<br>⚠️ 未接入：激光、`boss_hp`、`frame`、`invincible`；TH11 Bomb 消耗 power，无独立炸弹数量 |
+| **th11 东方地灵殿 1.00a** | ✅ 标量：`score` `lives` `power` `stage` `spell_id` `char_main` `char_sub` `graze` `frame`<br>✅ 自机坐标、普通弹幕数组、敌人链表，统一场地坐标，版本签名检查<br>✅ `frame`（0xA5734，严格帧同步）、Boss 血量/位置（`entities.combat`）、符卡<br>⚠️ 未接入：激光、`invincible`、`bombs`；TH11 Bomb 消耗 power，无独立炸弹数量 |
 | th06 / th07 / th08 / th10 / th12 / th13 / th14 | ⚠️ 仅有菜单导航模板，内存偏移待标定 |
 
 标定后的字段决定了**能观测到什么**：
@@ -309,18 +312,30 @@ th_set_game_speed({"factor": 1.0})   # 恢复原速
 
 ```
 E:\TouHou-Ai\
+├── README.md                        # 用户文档 (快速开始 / MCP 接入 / 工具一览)
+├── LICENSE                          # MIT
 ├── config.json                      # 运行配置 (奖励权重/控制/可视化/搜索路径)
 ├── opencode.jsonc                   # OpenCode V2 的 MCP 接入配置
 ├── requirements.txt / pyproject.toml
+├── run_pipeline.ps1                 # 一键循环训练入口
+├── .github\workflows\ci.yml         # CI: ruff + unittest + 自检
 ├── examples\rl_loop.py              # 不经过 MCP, 直接在 Python 里跑 RL 循环
 ├── examples\train.py                # 训练入口 (与 th_train_start 同一个 Trainer)
 ├── native\speedhack\                # 32 位时间缩放钩子 (DLL + 注入器 + 自检; build.ps1 构建)
-├── tools\probe.py                   # 真机探针 / 内存偏移标定 CLI
-├── tools\watch_training.py          # 训练实时监视窗口
-├── docs\OFFSET_CALIBRATION.md       # 内存偏移标定手册
-├── tests\                           # 51 个用例 (MCP 会话 / 训练 / 标定 / 时间缩放)
+├── tools\                           # 活跃 CLI (标定 / 录制 / 训练 / 评估 / 演示)
+│   └── legacy\                      # 已归档的一次性脚本 (见其 README)
+├── tests\                           # 96 个用例 (MCP 会话 / 训练 / 标定 / 时间缩放)
+├── docs\
+│   ├── STATUS.md                    # 项目现状 + 路线图 (唯一现状来源)
+│   ├── OFFSET_CALIBRATION.md        # 内存偏移标定手册
+│   ├── TH11_ENTITIES.md             # TH11 实体布局
+│   ├── COMBAT_TRAINING.md           # Boss / 符卡 / 对话训练
+│   ├── STAGE1_ATTEMPTS.md           # 第一面尝试记录
+│   ├── REPLAY_CLONING.md            # replay -> BC 设计
+│   └── history\                     # 历史会话交接 (只读, 可能过时)
+├── archive\                         # 非维护文件 (根目录残留 + 一次性诊断脚本)
 └── touhou_rl_mcp\
-    ├── server.py                    # MCP 工具定义 (26 个)
+    ├── server.py                    # MCP 工具定义 (30 个)
     ├── env.py                       # TouhouEnv: reset / step / observe + 奖励 + 统计
     ├── config.py  types.py  errors.py
     ├── backends\
@@ -342,11 +357,11 @@ E:\TouHou-Ai\
     │   ├── screenshot.py            # PrintWindow/BitBlt 多级回退截图
     │   └── visualize.py             # 状态可视化 (PIL)
     ├── rl\
-    │   ├── reward.py                # 奖励函数 (权重可在线调)
+    │   ├── reward.py                # 奖励函数 (权重可在线调) + 具名 profile
     │   └── stats.py                 # 单局/跨局统计
     └── training\                    # 本地智能体训练 (LLM 当"教练", 不逐帧亲自打)
-        ├── features.py              # 状态 -> 特征向量 (以自机为中心的最近 K 弹)
-        ├── policy.py                # 纯 numpy MLP 策略 (REINFORCE + 基线 + 价值头)
+        ├── features.py              # 状态 -> 特征向量 (危险图 / 最近 K 弹)
+        ├── policy.py                # 纯 numpy MLP 策略 (PPO / REINFORCE + 模仿)
         ├── trainer.py               # 后台线程训练器 (启动/停止/在线调参)
         ├── gym_env.py               # 可选 Gymnasium 适配 (接 SB3 / CleanRL)
         ├── visualize.py             # 学习曲线 / 仪表盘 / 帧拼图
@@ -370,22 +385,22 @@ E:\TouHou-Ai\
 - `mock` 是**简化**的弹幕模拟，不是东方物理的复刻，用于跑通管线与调参，
   不能替代真机。
 
-**下一步（按价值排序）**
+**下一步（按价值排序，持续更新于 [`docs/STATUS.md`](docs/STATUS.md)）**
 
-1. 用 `th_memory_scan` 把 th11 的 `player_x` `player_y` `graze` `boss_hp` 补齐 →
-   解锁 `move_to` / `dodge` / 伤害奖励。
-2. 把 `41 / 42` 里的 `frame` 偏移标定出来 → 严格的帧级同步（比墙钟同步稳得多）。
-3. ✅ 已提供**时间缩放钩子**（`native/speedhack/`，钩 `timeGetTime`）：
-   `th_set_game_speed(factor>1)` 加速可提高真机训练吞吐，`<1` 减速便于观察。
-4. ✅ 已提供 `gymnasium` 适配（`training/gym_env.py`），可直接接 SB3 / CleanRL；
-   训练循环也已通过 `th_train_*` 工具暴露给 Agent（后台线程跑，不占用 MCP 往返）。
-5. ✅ 标定流程已脚本化：`th_memory_find_player` / `th_memory_find_frame` 自动定位，
-   `th_offsets_write` 一键写回 offsets json（原子写 + `.json.bak` 备份）。
-6. 用 replay（`E:\thManager` 里的 `threp`）做离线预训练与行为克隆。
+1. **奖励重平衡 + 诊断"苟活"**：`alive_bonus` 远大于 `|time_penalty|`，长局里存活收益
+   可能压过通关收益；先加诊断（无敌期输出占比、动作分布），再调权重。
+2. **观测增强**：弹幕半径/类型、TTC（预计最近接近距离）、多帧堆叠。
+3. **真机鲁棒性**：进程/窗口/焦点看门狗，异常自动复位。
+4. **补齐 TH11** 的 `invincible`、激光；之后再考虑第二部作品。
+5. **replay → BC**：`tools/record_replay.py --bc-out` 采集，`tools/bc_from_replay.py` 训练
+   （设计见 [`docs/REPLAY_CLONING.md`](docs/REPLAY_CLONING.md)）。
 
 ---
 
-## 10. mock 训练增强（2026-10-18）
+## 10. 附录：mock 训练实验记录（2026-10-18，历史）
+
+> 以下是当时的实验记录与结论，参数此后可能已调整；不要当作当前配置说明。
+> 当前状态、奖励默认值与路线图见 [`docs/STATUS.md`](docs/STATUS.md)。
 
 针对"策略学会**被弹后靠无敌帧白嫖输出**、根本不学躲弹"这一根因做的改造：
 
