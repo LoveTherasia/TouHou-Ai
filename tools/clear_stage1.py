@@ -18,6 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from touhou_rl_mcp.config import Config
 from touhou_rl_mcp.env import TouhouEnv
+from touhou_rl_mcp.rl.reward import reward_profile
 from touhou_rl_mcp.training.features import encode_state, feature_dim
 from touhou_rl_mcp.training.policy import MLPPolicy
 from touhou_rl_mcp.training.trainer import build_action_table
@@ -53,7 +54,7 @@ def main():
     out.mkdir(parents=True)
     cfg = Config.load()
     cfg.patch({"backend": "memory", "game": "th11", "restart_process": True,
-               "reward": {"boss_damage_scale": 0.01, "spell_capture_bonus": 20},
+               "reward": reward_profile("real_stage1"),
                "slowdown": {"enabled": False}, "capture": {"prefer_printwindow": False}})
     env = TouhouEnv(cfg)
     report = {"args": vars(args), "policy": str(policy_path.resolve()), "cleared_stage1": False,

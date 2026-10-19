@@ -23,5 +23,6 @@ desktop.ini
 
 # 日志与临时文件
 *.log
-@AutomationLog.txt
+/@AutomationLog.txt
 *.tmp
+*.json.bak

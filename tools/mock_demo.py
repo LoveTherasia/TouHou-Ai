@@ -71,7 +71,7 @@ def main() -> int:
         print(f"[demo] policy={npz} obs={policy.obs_dim} hidden={list(policy.hidden)} "
               f"actions={len(actions)} {enc}")
     else:
-        print(f"[demo] 使用规则老师 RuleTeacher (无需策略文件)")
+        print("[demo] 使用规则老师 RuleTeacher (无需策略文件)")
 
     cfg = Config.load()
     cfg.patch({"backend": "mock", "game": "th11", "step_frames": args.step_frames,

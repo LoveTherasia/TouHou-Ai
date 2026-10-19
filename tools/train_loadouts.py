@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from touhou_rl_mcp.config import Config
 from touhou_rl_mcp.env import TouhouEnv
+from touhou_rl_mcp.rl.reward import reward_profile
 from touhou_rl_mcp.training.trainer import Trainer, TrainConfig
 
 
@@ -49,7 +50,7 @@ def main():
             cfg = Config.load()
             cfg.patch({"backend": "memory", "game": "th11", "restart_process": True,
                        "slowdown": {"enabled": False},
-                       "reward": {"boss_damage_scale": 0.01, "spell_capture_bonus": 20}})
+                       "reward": reward_profile("real_stage1")})
             env = CheckedEnv(cfg)
             tc = TrainConfig(episodes=args.episodes, max_steps=args.steps, character=character,
                 shot=shot, difficulty=0, lr=0.0001, entropy_coef=0.03,
