@@ -52,7 +52,14 @@ C:\Python313\python.exe -m venv .venv
 
 # 4) 直接训练本地智能体 (不经过 MCP; 与 th_train_start 用的是同一个 Trainer)
 .\.venv\Scripts\python.exe examples\train.py --backend mock --episodes 300
+
+# 5) 打开训练看板 (浏览器), 观察上面这次训练的曲线与动作分布
+.\.venv\Scripts\python.exe -m touhou_rl_mcp.dashboard --open
 ```
+
+训练看板是一个本地网页（标准库实现，无新依赖、不联网），扫描 `.runtime` 下所有含
+`train.jsonl` 的目录：曲线、动作直方图、评估记录、实时增量刷新。用法与扩展方式见
+[DASHBOARD.md](docs/DASHBOARD.md)。
 
 ## 2. 接入 OpenCode / Agent 平台
 
@@ -326,9 +333,10 @@ E:\TouHou-Ai\
 ├── examples\rl_loop.py              # 不经过 MCP, 直接在 Python 里跑 RL 循环
 ├── examples\train.py                # 训练入口 (与 th_train_start 同一个 Trainer)
 ├── native\speedhack\                # 32 位时间缩放钩子 (DLL + 注入器 + 自检; build.ps1 构建)
-├── tools\                           # 活跃 CLI (标定 / 录制 / 训练 / 评估 / 演示)
+├── tools\                           # 活跃 CLI (索引见 tools\README.md)
+│   ├── research\                    # 可复现实验 (gap_rl / gap_benchmark)
 │   └── legacy\                      # 已归档的一次性脚本 (见其 README)
-├── tests\                           # 96 个用例 (MCP 会话 / 训练 / 标定 / 时间缩放)
+├── tests\                           # 123 个用例 (MCP 会话 / 训练 / 标定 / 看板 / 观测)
 ├── docs\
 │   ├── STATUS.md                    # 项目现状 + 路线图 (唯一现状来源)
 │   ├── OFFSET_CALIBRATION.md        # 内存偏移标定手册
@@ -336,6 +344,8 @@ E:\TouHou-Ai\
 │   ├── COMBAT_TRAINING.md           # Boss / 符卡 / 对话训练
 │   ├── STAGE1_ATTEMPTS.md           # 第一面尝试记录
 │   ├── REPLAY_CLONING.md            # replay -> BC 设计
+│   ├── GAP_LEARNING.md              # 几何缺口 + 占用栅格的可行性实验
+│   ├── DASHBOARD.md                 # 训练看板使用与扩展
 │   └── history\                     # 历史会话交接 (只读, 可能过时)
 ├── archive\                         # 非维护文件 (根目录残留 + 一次性诊断脚本)
 └── touhou_rl_mcp\
@@ -363,8 +373,15 @@ E:\TouHou-Ai\
     ├── rl\
     │   ├── reward.py                # 奖励函数 (权重可在线调) + 具名 profile
     │   └── stats.py                 # 单局/跨局统计
+    ├── dashboard\                   # 训练可视化看板 (标准库 + 原生 canvas)
+    │   ├── registry.py              # run 发现 / JSONL 读取 / 指标自动发现
+    │   ├── server.py                # http.server 接口
+    │   └── static\                  # 单页前端
     └── training\                    # 本地智能体训练 (LLM 当"教练", 不逐帧亲自打)
         ├── features.py              # 状态 -> 特征向量 (危险图 / 最近 K 弹)
+        ├── occupancy.py             # 未来占用栅格 + TTA 缺口观测
+        ├── planner.py               # 时空搜索规划器 (实验脚手架)
+        ├── journal.py               # 训练日志 train.jsonl / steps.jsonl
         ├── policy.py                # 纯 numpy MLP 策略 (PPO / REINFORCE + 模仿)
         ├── trainer.py               # 后台线程训练器 (启动/停止/在线调参)
         ├── gym_env.py               # 可选 Gymnasium 适配 (接 SB3 / CleanRL)

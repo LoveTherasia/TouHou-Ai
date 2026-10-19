@@ -14,7 +14,7 @@
 
 | 项 | 结果 |
 |---|---|
-| 单元/集成测试 | `python -m unittest discover -s tests` → **96 通过，2 跳过**，约 13 s |
+| 单元/集成测试 | `python -m unittest discover -s tests` → **121 通过，2 跳过**，约 15 s |
 | 自检 | `python -m touhou_rl_mcp selftest --dodge --steps 200` → 正常出图 |
 | MCP 工具 | **30 个** `th_*`（server.py） |
 | 源码规模 | 约 2.07 万行（库 + tools + tests + native + docs） |
@@ -31,8 +31,10 @@
 ## 3. 目录职责
 
 ```
-touhou_rl_mcp/     库本体（env / 后端 / 内存 / 输入 / 采集 / 奖励 / 训练）
-tools/             活跃 CLI（标定、录制、训练、评估、演示）
+touhou_rl_mcp/     库本体（env / 后端 / 内存 / 输入 / 采集 / 奖励 / 训练 / 看板）
+touhou_rl_mcp/dashboard/  训练可视化看板（标准库 http.server + 原生 canvas）
+tools/             活跃 CLI（索引见 tools/README.md）
+tools/research/    可复现实验（gap_rl / gap_benchmark）
 tools/legacy/      已归档的一次性脚本（见其 README）
 tests/             unittest 套件
 examples/          train / rl_loop 示例入口
@@ -88,7 +90,7 @@ native/speedhack/  32 位时间缩放钩子（可选，需自行构建）
   （约 0.2 秒）——行为上限是贴底横移，从不离开下半区。
 - 短程规划老师 `horizon` 在 6 种弹型中 5 种于 587~1975 帧内死亡，`y` 被压到 400~440。
 - 新增 `training/planner.py`（未来推演 + 宏动作 beam search）与
-  `tools/gap_benchmark.py`（可复现基准）：
+  `tools/research/gap_benchmark.py`（可复现基准）：
   - 静态单缺口环：规划器能穿出（最大位移 432px），但基准里仍掉 1 残，
     `min_clear=6.2`；参数稍变结果就不稳定。
   - 多层闭合环（新弹型 `closing_ring`）：noop 546 帧、force 582 帧、
@@ -109,7 +111,7 @@ native/speedhack/  32 位时间缩放钩子（可选，需自行构建）
 #### P2 可行性验证 · 二（2026-10-19，缺口任务）
 
 新增 `wall_gate`（真能封死的弹幕墙 + 单缺口）与 `training/occupancy.py`
-（时间分层占用栅格 + 每列最早到达时间 TTA 剖面），在 `tools/gap_rl.py` 里做
+（时间分层占用栅格 + 每列最早到达时间 TTA 剖面），在 `tools/research/gap_rl.py` 里做
 "表示 / 密集信号 / 信任域"三层对照。**结论：几何缺口 + 占用栅格可行**，
 但必须配套弱监督与 BC 锚，纯 RL 会坍缩成"不动"。完整数据见
 [`docs/GAP_LEARNING.md`](GAP_LEARNING.md)。
@@ -127,4 +129,6 @@ native/speedhack/  32 位时间缩放钩子（可选，需自行构建）
 - 战斗训练 / 符卡与对话：`docs/COMBAT_TRAINING.md`
 - 第一面尝试记录：`docs/STAGE1_ATTEMPTS.md`
 - replay 克隆设计：`docs/REPLAY_CLONING.md`
+- 缺口学习实验：`docs/GAP_LEARNING.md`
+- 训练看板：`docs/DASHBOARD.md`
 - 历史会话：`docs/history/2026-10-17_PROGRESS.txt`、`docs/history/2026-10-18_NEXT_SESSION.txt`

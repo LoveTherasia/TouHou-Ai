@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>训练看板 · TouHou-Ai</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <strong>TouHou-Ai</strong>
+      <span>训练看板</span>
+    </div>
+    <div class="side-tools">
+      <input id="search" type="search" placeholder="筛选 run…" autocomplete="off">
+      <button id="refresh" title="重新扫描">刷新</button>
+    </div>
+    <label class="side-toggle"><input id="show-all" type="checkbox"> 显示内部 run（`_` 开头的临时产物）</label>
+    <div id="runs" class="runs"></div>
+    <div class="side-foot">
+      <span id="status">就绪</span>
+      <button id="theme" title="切换主题">主题</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="head">
+      <div class="head-text">
+        <h1 id="run-name">选择左侧的一次训练</h1>
+        <p id="run-path" class="muted">run = 任何包含 train.jsonl 的目录</p>
+      </div>
+      <div id="chips" class="chips"></div>
+    </header>
+
+    <section class="toolbar">
+      <div id="metrics" class="metric-chips"></div>
+      <div class="toolbar-right">
+        <label class="field">平滑
+          <input id="smooth" type="range" min="0" max="30" value="0">
+          <span id="smooth-val">0</span>
+        </label>
+        <label class="field chk"><input id="norm" type="checkbox"> 归一化</label>
+        <label class="field chk"><input id="live" type="checkbox"> 实时</label>
+      </div>
+    </section>
+
+    <section class="card chart-card">
+      <div id="chart-empty" class="empty">还没有数据 —— 选一个 run，或勾选指标</div>
+      <canvas id="chart"></canvas>
+      <div id="tip" class="tip"></div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>动作分布 <span class="muted small">最近 40 局</span></h2>
+        <div id="actions" class="actions"><span class="empty small">—</span></div>
+      </div>
+      <div class="card">
+        <h2>评估记录</h2>
+        <div id="eval"><span class="empty small">—</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>最近 episode</h2>
+      <div id="table" class="table"><span class="empty small">—</span></div>
+    </section>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

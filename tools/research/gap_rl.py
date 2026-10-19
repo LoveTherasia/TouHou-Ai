@@ -19,23 +19,25 @@
 
 用法::
 
-    python tools/gap_rl.py --arm both --updates 60
-    python tools/gap_rl.py --arm geo  --baseline      # 附 noop / 缺口跟随 基准
+    python tools/research/gap_rl.py --arm both --updates 60
+    python tools/research/gap_rl.py --arm geo  --baseline      # 附 noop / 缺口跟随 基准
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from touhou_rl_mcp.config import Config            # noqa: E402
+from touhou_rl_mcp.config import Config, runtime_dir   # noqa: E402
 from touhou_rl_mcp.env import TouhouEnv            # noqa: E402
+from touhou_rl_mcp.training.journal import Journal  # noqa: E402
 from touhou_rl_mcp.training.occupancy import (     # noqa: E402
     GapObservation, GapSpec, _bullets, _tta_profile,
 )
@@ -411,6 +413,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--baseline", action="store_true", help="同时跑 noop / 缺口跟随 基准")
     ap.add_argument("--eval-every", type=int, default=10)
+    ap.add_argument("--run-dir", default="",
+                    help="训练记录目录 (默认 .runtime/runs/<arm>-<时间戳>, 可被看板直接读取)")
+    ap.add_argument("--no-journal", action="store_true", help="不写训练记录")
     ap.add_argument("--shaping", type=float, default=0.0,
                     help="自机所在列安全余量的势函数奖励系数 (0=关)")
     ap.add_argument("--hidden", type=int, default=64, help="隐层宽度, 0=线性策略")
@@ -462,6 +467,22 @@ def main() -> int:
             f"{ACTIONS[i].replace('+shoot', '') or 'stay'}={dist[i]:.0%}"
             for i in np.argsort(-dist) if dist[i] > 0.02))
 
+    journal = None
+    run_dir = None
+    if not args.no_journal:
+        run_dir = Path(args.run_dir) if args.run_dir else (
+            runtime_dir() / "runs" / f"{args.arm}-{time.strftime('%Y%m%d-%H%M%S')}")
+        journal = Journal(run_dir)
+        (run_dir / "meta.json").write_text(json.dumps({
+            "script": "tools/research/gap_rl.py",
+            "arm": args.arm,
+            "obs": enc.describe(),
+            "train_scenario": train_scenario,
+            "heldout": HELDOUT_SCENARIOS,
+            "args": vars(args),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"训练记录: {run_dir}")
+
     best = 0.0
     t0 = time.time()
     for it in range(1, args.updates + 1):
@@ -494,11 +515,27 @@ def main() -> int:
         else:
             loss = 0.0
         mean_frames = float(np.mean(survived)) if survived else 0.0
+        if journal is not None:
+            acts = np.bincount(np.concatenate(batch_act), minlength=len(ACTIONS)) \
+                if batch_act else np.zeros(len(ACTIONS), dtype=int)
+            journal.episode({
+                "episode": it,
+                "return": round(mean_frames, 2),
+                "steps": int(acts.sum()),
+                "loss": round(float(loss), 4),
+                "actions": {ACTIONS[i]: int(acts[i]) for i in range(len(ACTIONS)) if acts[i]},
+            })
         msg = (f"[{it:3d}/{args.updates}] 训练存活 {mean_frames:6.0f} 帧 "
                f"loss={loss:+.3f}  {time.time() - t0:5.1f}s")
         if it % args.eval_every == 0 or it == args.updates:
             score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames)
             best = max(best, score)
+            if run_dir is not None:
+                with open(run_dir / "eval.jsonl", "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"step": it, "name": "heldout",
+                                         "score": round(score, 1),
+                                         "detail": [int(x) for x in detail]},
+                                        ensure_ascii=False) + "\n")
             msg += f" | 泛化 {score:6.0f} 帧 {[int(x) for x in detail]}"
         print(msg, flush=True)
 

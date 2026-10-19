@@ -34,12 +34,14 @@ dev = ["ruff>=0.6", "pywin32>=306 ; sys_platform == 'win32'"]
 
 [project.scripts]
 touhou-rl-mcp = "touhou_rl_mcp.__main__:main"
+touhou-rl-dashboard = "touhou_rl_mcp.dashboard.server:main"
 
 [tool.setuptools]
 packages = [
     "touhou_rl_mcp",
     "touhou_rl_mcp.backends",
     "touhou_rl_mcp.capture",
+    "touhou_rl_mcp.dashboard",
     "touhou_rl_mcp.games",
     "touhou_rl_mcp.inputs",
     "touhou_rl_mcp.memory",
@@ -49,6 +51,7 @@ packages = [
 
 [tool.setuptools.package-data]
 "touhou_rl_mcp.games" = ["offsets/*.json"]
+"touhou_rl_mcp.dashboard" = ["static/*"]
 
 [tool.ruff]
 line-length = 120

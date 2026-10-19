@@ -5,9 +5,9 @@
 
 用法::
 
-    python tools/gap_benchmark.py --scenario static_ring --agent planner --escape-weight 0.3
-    python tools/gap_benchmark.py --scenario closing_ring --agent force --frames 1800
-    python tools/gap_benchmark.py --scenario dense_ring --agent planner
+    python tools/research/gap_benchmark.py --scenario static_ring --agent planner --escape-weight 0.3
+    python tools/research/gap_benchmark.py --scenario closing_ring --agent force --frames 1800
+    python tools/research/gap_benchmark.py --scenario dense_ring --agent planner
 
 指标:
     steps        存活帧数 (死亡或达到上限)
@@ -27,7 +27,7 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 

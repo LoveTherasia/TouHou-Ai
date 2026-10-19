@@ -39,7 +39,7 @@
 |---|---|
 | `touhou_rl_mcp/training/occupancy.py` | `GapObservation` / `GapSpec`：占用栅格 + TTA 剖面 + 缺口几何量 |
 | `touhou_rl_mcp/backends/patterns.py` | `wall_gate`（真能封死的弹幕墙）、`ring_gate`（扩张环 + 旋转缺口） |
-| `tools/gap_rl.py` | 训练/评估脚本：三组观测对照、势函数塑形、感知预训练、BC 锚 |
+| `tools/research/gap_rl.py` | 训练/评估脚本：三组观测对照、势函数塑形、感知预训练、BC 锚 |
 | `tests/test_occupancy.py` | 固定观测语义（缺口识别、边界列、命中半径） |
 
 复现"满帧"结果：
