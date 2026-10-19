@@ -46,6 +46,10 @@ C:\Python313\python.exe -m venv .venv
 # 3) 单元 + 集成测试 (含实体读取 / 真实 stdio MCP 会话 / 训练控制面 / 标定工具)
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 
+# 3b) 静态检查 (可选; 只启用 bug 级规则, CI 会跑)
+.\.venv\Scripts\python.exe -m pip install ruff
+.\.venv\Scripts\python.exe -m ruff check .
+
 # 4) 直接训练本地智能体 (不经过 MCP; 与 th_train_start 用的是同一个 Trainer)
 .\.venv\Scripts\python.exe examples\train.py --backend mock --episodes 300
 ```

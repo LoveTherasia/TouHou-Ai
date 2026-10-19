@@ -35,9 +35,6 @@ dev = ["ruff>=0.6", "pywin32>=306 ; sys_platform == 'win32'"]
 [project.scripts]
 touhou-rl-mcp = "touhou_rl_mcp.__main__:main"
 
-[project.urls]
-Homepage = "https://github.com/"
-
 [tool.setuptools]
 packages = [
     "touhou_rl_mcp",
