@@ -1,0 +1,132 @@
+{
+  "key": "th12",
+  "name_zh": "东方星莲船",
+  "name_en": "Undefined Fantastic Object",
+  "exes": [
+    "th12c.exe",
+    "th12.exe"
+  ],
+  "folder_hints": [
+    "th12",
+    "星莲船",
+    "星蓮船"
+  ],
+  "calibrated": false,
+  "fields": {
+    "score": {
+      "offset": null,
+      "type": "i32"
+    },
+    "lives": {
+      "offset": null,
+      "type": "i32"
+    },
+    "power": {
+      "offset": null,
+      "type": "i32"
+    },
+    "stage": {
+      "offset": null,
+      "type": "i32"
+    },
+    "spell_id": {
+      "offset": null,
+      "type": "i32"
+    },
+    "char_main": {
+      "offset": null,
+      "type": "i32"
+    },
+    "char_sub": {
+      "offset": null,
+      "type": "i32"
+    },
+    "graze": {
+      "offset": null,
+      "type": "i32"
+    },
+    "frame": {
+      "offset": null,
+      "type": "i32"
+    },
+    "player_x": {
+      "offset": null,
+      "type": "f32"
+    },
+    "player_y": {
+      "offset": null,
+      "type": "f32"
+    },
+    "boss_hp": {
+      "offset": null,
+      "type": "i32"
+    }
+  },
+  "menu_sequence": [
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 8,
+      "index_from": "menu_index"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 6,
+      "index_from": "difficulty"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 4,
+      "index_from": "character"
+    },
+    {
+      "type": "select",
+      "direction": "right",
+      "anchor": "left",
+      "anchor_times": 4,
+      "index_from": "shot"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 60
+    },
+    {
+      "type": "wait_in_game",
+      "timeout_frames": 1200
+    }
+  ],
+  "notes": "偏移量待标定 (memory_scan 工具)。UFO 系统 (飞碟收集) 建议额外标定计数器以获得更好的奖励塑形。"
+}

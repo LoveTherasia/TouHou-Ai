@@ -1,0 +1,27 @@
+.venv/
+.runtime/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# native/speedhack 构建产物 (用 native/speedhack/build.ps1 生成)
+native/speedhack/bin/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+@AutomationLog.txt
+*.tmp

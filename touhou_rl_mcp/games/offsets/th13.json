@@ -1,0 +1,132 @@
+{
+  "key": "th13",
+  "name_zh": "东方神灵庙",
+  "name_en": "Ten Desires",
+  "exes": [
+    "th13c.exe",
+    "th13.exe"
+  ],
+  "folder_hints": [
+    "th13",
+    "神灵庙",
+    "神霊廟"
+  ],
+  "calibrated": false,
+  "fields": {
+    "score": {
+      "offset": null,
+      "type": "i32"
+    },
+    "lives": {
+      "offset": null,
+      "type": "i32"
+    },
+    "power": {
+      "offset": null,
+      "type": "i32"
+    },
+    "stage": {
+      "offset": null,
+      "type": "i32"
+    },
+    "spell_id": {
+      "offset": null,
+      "type": "i32"
+    },
+    "char_main": {
+      "offset": null,
+      "type": "i32"
+    },
+    "char_sub": {
+      "offset": null,
+      "type": "i32"
+    },
+    "graze": {
+      "offset": null,
+      "type": "i32"
+    },
+    "frame": {
+      "offset": null,
+      "type": "i32"
+    },
+    "player_x": {
+      "offset": null,
+      "type": "f32"
+    },
+    "player_y": {
+      "offset": null,
+      "type": "f32"
+    },
+    "boss_hp": {
+      "offset": null,
+      "type": "i32"
+    }
+  },
+  "menu_sequence": [
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 8,
+      "index_from": "menu_index"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 6,
+      "index_from": "difficulty"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 45
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 4,
+      "index_from": "character"
+    },
+    {
+      "type": "select",
+      "direction": "right",
+      "anchor": "left",
+      "anchor_times": 4,
+      "index_from": "shot"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 60
+    },
+    {
+      "type": "wait_in_game",
+      "timeout_frames": 1200
+    }
+  ],
+  "notes": "偏移量待标定 (memory_scan 工具)。神灵 (小神灵收集) 系统可用于奖励塑形。"
+}

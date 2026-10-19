@@ -1,0 +1,17 @@
+# 统一行尾：源码用 LF，Windows 脚本保留 CRLF
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制/构建产物不做行尾转换
+*.obj binary
+*.lib binary
+*.exp binary
+*.dll binary
+*.exe binary
+*.npz binary
+*.png binary
+*.gif binary
+*.jpg binary
+*.pdf binary

@@ -1,0 +1,33 @@
+{
+  "key": "th06",
+  "name_zh": "东方红魔乡",
+  "name_en": "Embodiment of Scarlet Devil",
+  "exes": ["th06c.exe", "th06.exe"],
+  "folder_hints": ["th06", "红魔乡", "紅魔郷"],
+  "calibrated": false,
+  "fields": {
+    "score":      { "offset": null, "type": "i32", "label": "分数" },
+    "lives":      { "offset": null, "type": "i32", "label": "残机" },
+    "power":      { "offset": null, "type": "i32", "label": "灵力" },
+    "stage":      { "offset": null, "type": "i32" },
+    "spell_id":   { "offset": null, "type": "i32" },
+    "char_main":  { "offset": null, "type": "i32" },
+    "char_sub":   { "offset": null, "type": "i32" },
+    "graze":      { "offset": null, "type": "i32" },
+    "frame":      { "offset": null, "type": "i32" },
+    "player_x":   { "offset": null, "type": "f32" },
+    "player_y":   { "offset": null, "type": "f32" },
+    "boss_hp":    { "offset": null, "type": "i32" }
+  },
+  "menu_sequence": [
+    { "type": "press", "buttons": ["confirm"], "hold": 6, "after": 45 },
+    { "type": "select", "direction": "down", "anchor": "up", "anchor_times": 8, "index_from": "menu_index" },
+    { "type": "press", "buttons": ["confirm"], "hold": 6, "after": 45 },
+    { "type": "select", "direction": "down", "anchor": "up", "anchor_times": 6, "index_from": "difficulty" },
+    { "type": "press", "buttons": ["confirm"], "hold": 6, "after": 45 },
+    { "type": "select", "direction": "down", "anchor": "up", "anchor_times": 4, "index_from": "character" },
+    { "type": "press", "buttons": ["confirm"], "hold": 6, "after": 60 },
+    { "type": "wait_in_game", "timeout_frames": 1200 }
+  ],
+  "notes": "th06 是 DirectX8 时代的老作品, 内存布局与 th10+ 完全不同, 且无独立 player 结构指针的公开偏移表。建议先用 memory_scan 标定 score(分数变化明显) 再回溯。窗口类名 `Touhou Project`。"
+}

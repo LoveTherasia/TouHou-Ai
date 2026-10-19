@@ -1,0 +1,64 @@
+{
+  "backend": "mock",
+  "game": "th11",
+  "game_dir": "",
+  "restart_process": false,
+  "step_frames": 4,
+  "max_step_frames": 600,
+  "max_episode_frames": 43200,
+  "auto_reset": false,
+  "final_stage": 6,
+  "start_stage": 1,
+  "launch_wait_seconds": 6.0,
+  "reward": {
+    "score_scale": 1e-05,
+    "graze_scale": 0.02,
+    "power_scale": 0.1,
+    "life_bonus": 5.0,
+    "miss_penalty": -200.0,
+    "death_penalty": -600.0,
+    "stage_clear_bonus": 1500.0,
+    "game_clear_bonus": 6000.0,
+    "spell_capture_bonus": 20.0,
+    "spell_clear_bonus": 150.0,
+    "boss_damage_scale": 0.1,
+    "invincible_output_scale": 0.0,
+    "invincible_frames": 150,
+    "danger_scale": 4.0,
+    "danger_radius": 50.0,
+    "alive_bonus": 0.3,
+    "time_penalty": -0.01,
+    "clip": 8000.0,
+    "shaping_scale": 1.0
+  },
+  "control": {
+    "tick_hz": 60,
+    "focus_window": true,
+    "key_hold_min_frames": 1,
+    "keymap": {}
+  },
+  "capture": {
+    "out_dir": "",
+    "max_width": 960,
+    "jpeg_quality": 90,
+    "prefer_printwindow": true
+  },
+  "visualize": {
+    "scale": 1.0,
+    "show_bullets": true,
+    "show_grid": true,
+    "show_hud": true,
+    "trail_length": 180
+  },
+  "search_roots": [
+    "F:\\\\",
+    "E:\\\\",
+    "D:\\\\"
+  ],
+  "search_depth": 2,
+  "scanner": {
+    "max_region_mb": 64,
+    "align": 4,
+    "max_candidates": 20000
+  }
+}

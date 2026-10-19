@@ -1,0 +1,279 @@
+========================================================================
+ TouHou-Ai 会话交接文档 (NEXT_SESSION)
+ 生成时间: 2026-10-18
+ 用途: 把当前结论、根因、可调策略、待办清单完整交给下一个会话
+ 相关: PROGRESS.txt 是更早版本的记录(部分已过时, 以本文件为准)
+========================================================================
+
+【0. 一句话现状】
+基础设施已完备(真机/ mock 观测、训练器、DAgger、日志、进度图全都有),
+"完整通关"仍未达成。已定位根因: **策略学会了"贪输出 + 靠被弹复位后的无敌帧
+空窗零风险秒 Boss", 根本没学躲弹 -> 第 2 面被密集弹幕直接秒。**
+
+------------------------------------------------------------------------
+【1. 本轮确认的根因 (最重要)】
+------------------------------------------------------------------------
+机制 (mock 侧代码可完整复现, 真机同理):
+  a) `backends/mock.py::_hit()`: 被弹时把自机 **瞬移** 回 (192, 416), 并给
+     `INVINCIBLE_FRAMES=150` (2.5 秒无敌);
+  b) `_hit()` 同时清掉自机周围 60px 内的弹幕 -> **弹幕空窗**;
+  c) 奖励里 `boss_damage_scale` 很高(工具里 1.0) -> 无敌期内"零风险"持续输出;
+  d) `miss_penalty` 只有 -30 (掉一残才 -30), `death_penalty` -100 ~ -150;
+     => 一次掉残换来 2.5 秒安全输出, **对策略是划算的**。
+
+结果: 动作分布长期以 `shoot`(站桩) 为主(52%~70%); 贪心评估最远只到 **第 2 面**;
+      demo 里 168 步就通关第 1 面、随后在第 2 面被秒。
+即: **它优化的是"被打之后的反击", 不是"不被弹"。**
+
+结论: 这是**奖励设计漏洞(激励被弹)** + **观测缺失(看不到无敌帧/危险提前量)**,
+      不是单纯的训练量问题。
+
+------------------------------------------------------------------------
+【2. 现状盘点 (已验证可用)】
+------------------------------------------------------------------------
+2.1 真机观测 (th11 1.00a, 带代码签名校验)
+    - th11.json fields 已标定: score/lives/power/stage/spell_id/char_main/
+      char_sub/graze(0xA5754)/frame(0xA5734)/player_x+player_y(指针链
+      [[th11c.exe+0xA8EB4]+0x3FC/+0x400])
+    - entities: 弹幕数组(管理器[base+0xA8D68]+0x64, 2000 槽, 步长 0x910,
+      位置+0x43C/+0x440, 状态 u16 +0x4B2) / 敌机链表([base+0xA8D7C]+0x68,
+      位置+0x1070/+0x1074) / Boss 血量(敌人管理器+0x1C, +0x252C/+0x2530) /
+      符卡管理器([base+0xA8D6C])
+    - 坐标统一为 playfield_top_left (384x448)
+    - **未标定**: bombs(无独立计数, 放弹扣 power) / invincible / boss_hp 字段
+      (Boss 血量实际走 entities.combat)
+
+2.2 弹幕速度观测 (本轮新增并验证)
+    - `memory/bullettrack.py::BulletTracker`: 按 active_slots 跨帧差分求速度,
+      防 dt 异常 / 槽位回收(位移 >15px/帧 置 0)
+    - 写入 `state.raw["bullet_velocity"]`, 与 state.bullets 同序
+    - **坑: 必须用 `env.step()` 返回的 state; `get_state()` 不推进帧 -> dt=0 -> 速度全 0**
+    - 实测 |v| 中位 1.25~2.5 px/游戏帧, 合理
+
+2.3 特征 (training/features.py)
+    - 10 全局 + k_bullets × (dx,dy,dist,valid[,vx,vy]) + k_enemies × (dx,dy,dist,valid)
+    - 常用配置: `--k-enemies 8 --bullet-velocity` -> **obs_dim = 138**
+    - mock 侧也已提供 bullet_velocity, 两个后端布局一致
+
+2.4 训练器 (training/trainer.py)
+    - REINFORCE + 基线 + 价值头 (纯 numpy MLP)
+    - `--teacher guard`   : 老师(TacticalGuard)接管动作, 策略做行为克隆
+    - `--teacher dagger` : 策略驱动游戏, 老师对访问到的状态打标签 (修 BC 漂移)
+      + `--dagger-beta` 控制老师接管比例(默认 0.2)
+    - `--bullet-velocity` / `--k-enemies` / `--bomb` / `--log-steps` /
+      `--plot-every` / `--max-steps 0`(=不限长) / `--hidden 256,256`
+    - 日志: out_dir/train.jsonl(每局)、steps.jsonl(每步)、progress.png(四联图)
+    - 终止: 只认生命值(`game_over_lives=-1`), `left_game` 关闭; max_steps<=0 不截断
+    - 炸弹: 紧急保护 BombGuard(最近弹 <14px 才放, 冷却 45 帧, 每局 ≤6)
+
+2.5 mock 后端
+    - **手写的简化模拟器, 不是地灵殿真实弹幕**(已确认):
+      敌机 x 均匀分布竖直下落 + 3 连自机狙; Boss 3 种通用弹型(环形/5连狙/3臂螺旋)
+      每 240 帧轮换; 难度只按 stage 线性加量; `spell_id=43+phase` 是占位符
+    - 速度 ~1400 步/秒 (真机 9~20 步/秒)
+    - 参数: PLAYER_SPEED 4.4 / FOCUS 2.0 / HITBOX 2.0 / GRAZE 14 / MAX_LIVES 2 /
+      POWER 1→4 / INVINCIBLE_FRAMES 150 / MAX_BULLETS 900
+
+2.6 训练产物
+    - `.runtime/mock_full2/policy_best.npz` (256x256, obs138, mock 贪心最远 2 面)
+    - `.runtime/th11_clear/{round1,teacher1,teacher2,vel1,dagger1,mockguide}/policy.npz`
+    - `.runtime/stage1_attempts/*/report.json` (真机第一面测试报告)
+    - `.runtime/mock_demo/demo_ep1.gif|strip_ep1.png` (mock 演示)
+    - 测试: `python -m unittest discover -s tests` -> **73 通过**
+
+------------------------------------------------------------------------
+【3. 可调整的策略 (完整清单, 按优先级)】
+------------------------------------------------------------------------
+A. 奖励设计  ★最高优先 (直接针对根因)
+  A1 大幅降低 `boss_damage_scale`: 1.0 -> 0.05~0.2
+     位置: config.json / tools/mock_full_clear.py 的 REWARD
+     风险: 太低会不推进(第 1 面无输出); 建议配合 A3 一起做
+  A2 加重被弹代价: `miss_penalty` -30 -> -80~-150; `death_penalty` -100~-150 -> -250~-400
+     注意 clip 要能容纳(见 A6)
+  A3 ★封堵"无敌帧空窗刷输出"漏洞(核心):
+     位置: touhou_rl_mcp/rl/reward.py
+     做法(任选/组合):
+       (i) 当 `state.invincible > 0`(真机需先标定 invincible; mock 可直接读)时,
+           `boss_damage`/`score` 分量打折或归零 —— 让"被打后的输出"不再免费;
+       (ii) 对 "掉残后 N 帧内的输出" 打折(用 _hit 后时间窗模拟同一效果);
+       (iii) `miss_penalty` 改为"掉残即终止该生命期的全部输出收益"这类更狠的惩罚;
+       (iv) 只在 `invincible == 0` 时才给 `alive_bonus`(无敌期不给存活奖励)。
+     验收: 动作分布里 `shoot` 占比应明显下降; 被弹次数/百步下降。
+  A4 强化危险信号: `danger_scale` 1.5~2.5 -> 3~5; 可把 `danger_radius` 调大(45→60),
+     或把"按 TTC/最近接近距离"的预测危险加进奖励(见 B5)
+  A5 `alive_bonus` 与"安全"挂钩: 如 `alive_bonus × (1 - danger_norm)`
+  A6 ★统一奖励来源(现在不一致!):
+     `config.json`: boss_damage_scale=0.02, stage_clear=1200, clip=2000
+     `tools/mock_full_clear.py`: boss_damage_scale=1.0, stage_clear=300, clip=150
+     建议: 把奖励集中到一处(如 config.json 的 reward + 命名 profile),
+           工具只引用, 避免"同一实验两套参数"
+  A7 clip 与各分量尺度联动: clip 必须 ≥ 最大单步奖励(过面/通关奖励会单独落在一步),
+     否则过面奖励被裁掉(clip=100/300 曾吃掉 stage_clear_bonus)
+
+B. 观测 (features.py / entities.py)
+  B1 加入 `invincible`(无敌帧) 到全局特征 —— 配合 A3, 让策略知道"现在打也没意义/安全"
+  B2 加入弹幕"类型/半径"(大弹 vs 小弹): 真机需扩展 entities 布局读 bullet 的 r/type 字段
+  B3 多帧堆叠(frame stacking, 如 3 帧) 提供短期记忆, 利于躲"自机狙"
+  B4 敌人速度/朝向 + Boss 阶段/是否无敌(入场时为无敌, 输出无意义)
+  B5 危险度标量特征: 最近弹距离、预计最近接近距离(TTC)、危险弹数量
+  B6 激光/其它弹型(文档标注未接入)
+
+C. 动作空间 (trainer.build_action_table)
+  C1 加 `focus`(低速精躲): 9 -> 18 动作 (mock 已有 FOCUS 速度 2.0)
+  C2 加 `bomb` 动作(或在真机保留 BombGuard 规则保护; 两者别混)
+  C3 `step_frames` 4 -> 2/3: 更细控制, 真机更稳(真机已用 2)
+  C4 可选: 允许"只移动不射击"的动作(摆脱"必须常按 shoot"的隐式约束)
+
+D. 算法/训练
+  D1 REINFORCE 方差大 -> 换 PPO/GAE, 或直接用 SB3/CleanRL
+     (项目已有 `training/gym_env.py` 适配)
+  D2 ★课程学习: 给 mock 加 `start_stage`(从第 N 面开局), 逐面推进再串起来;
+     真机则用 `restart_process` + 指定难度
+  D3 熵退火(已有于 mock_full_clear)、学习率、batch_episodes 调参
+  D4 贪心评估 + 最佳快照(已有, 保住好策略不被后期退化覆盖)
+  D5 区分评估指标: 道中被弹/Boss 被弹、无敌期输出占比、平均存活步数、最远面数、通关率
+
+E. 环境与数据
+  E1 ★replay -> 真实数据(可行性已确认, 见第 5 节)
+  E2 真机 DAgger(老师=TacticalGuard)长跑(已实现, 建议累积到 2~5 万+ 样本再评估)
+  E3 真机提速: `native/speedhack` + `th_set_game_speed`(已可用, 4x 可显著提高真机吞吐)
+
+F. 诊断 (先做, 几分钟)
+  F1 逐步诊断日志: {最近弹距离/相对速度/danger 分量/所选动作/Δx,Δy/是否被弹/invincible}
+  F2 被弹事件上下文: 被弹那一步的最近弹、动作、是否在无敌期、道中 or Boss
+  F3 统计"有弹 dx≈0 且朝自机飞来(dist<40)时, 选横向动作的比例"
+     -> 区分"没信号" vs "看得见但选择不动"
+  F4 mock 与真机各跑一遍, 对比
+
+------------------------------------------------------------------------
+【4. 建议执行顺序 (带验收标准)】
+------------------------------------------------------------------------
+阶段 0 (约 30~60 分钟, mock):
+  1) 统一奖励配置(第 3.A6 节); 2) 实现 A3(无敌帧封堵) + A1/A2 调权重;
+  3) 加 F1/F2 诊断日志; 4) 跑 mock 1000~2000 局看诊断指标
+  验收: `shoot` 占比明显下降; 被弹次数/百步下降; 最优贪心最远面数提升
+
+阶段 1 (mock 课程学习):
+  给 mock 加 start_stage, 从第 2/3 面起训, 逐面推进到第 6 面
+  验收: 贪心评估最远面数 2 -> 3 -> 4 -> 6; 出现 通关(cleared) 样本
+  注意: mock 与真机差距大, 此阶段目标是验证"奖励/观测/网络在长局里能否支撑"
+
+阶段 2 (动作/算法增强, 可选):
+  C1 加 focus; D1 换 PPO/GAE; 再跑 mock
+  验收: 在 mock 上通关率显著提升
+
+阶段 3 (真机):
+  真机 DAgger(老师=TacticalGuard) + speedhack 加速(4x) 长跑,
+  每隔 N 局用 `tools/clear_stage1.py --mode policy` 测"策略单独"表现
+  验收: 策略单独存活步数/最远面数持续上升; 最终能单独通关第一面
+
+阶段 4 (可选, 最接近真实分布):
+  replay -> (真实状态, 人类动作) 数据集 -> 行为克隆/离线 RL
+
+------------------------------------------------------------------------
+【5. replay 方案可行性 (已确认, 但注意关键事实)】
+------------------------------------------------------------------------
+事实: 东方的 `.rpy` **只存 随机种子 + 每帧输入**, **不存敌机/弹幕位置**;
+      回放是游戏用它自己确定性重演。所以:
+  x 不能"从 replay 解析出弹幕轨迹"
+  v 可行且推荐的做法:
+     1) 解析 .rpy 的逐帧输入(th11 格式, 可参考 thtk 等社区工具);
+     2) 让游戏回放(游戏自带 replay 播放器最稳, 帧锁定; 或用 SendInput 逐帧喂入);
+     3) 用我们的实体读取器, 以 `frame`(0xA5734) 计数**每帧读一次状态**;
+     4) 得到 `(真实状态, 人类动作)` 数据集 -> 行为克隆 / 离线 RL。
+  前提/成本: replay 与游戏版本必须一致(F 盘 1.00a ✓);
+            每帧读 ~4.6MB(约 1~3ms), 60Hz 可行;
+            .rpy 解析需要按 th11 规范写(或用现成工具转成帧输入表)。
+  结论: "把 replay 变成模拟器" 不行; "把 replay 变成真实数据来训练" 可行,
+        是缩小 sim-to-real 的正路。
+
+------------------------------------------------------------------------
+【6. 已知坑 (务必避免重复踩)】
+------------------------------------------------------------------------
+1) ★不要把 PowerShell 的 `Get-Content ... | Set-Content ...` 用于改源码:
+   它会把 UTF-8 文件写坏(换行重复 + 中文变 U+FFFD + 代码行被并进注释)。
+   本项目已被此坑弄坏过 trainer.py(已修复)。改文件请用编辑工具或 Python 写。
+2) `env.get_state()` 不推进帧: 用它的 state 取 `bullet_velocity` 会全是 0;
+   必须用 `env.step()` 返回的 state。
+3) `clip` 会裁掉单步大奖励(过面/通关奖励落在一步) —— 见 A7。
+4) `config.json` 与各 tools 里的 REWARD 目前不一致 —— 见 A6。
+5) mock ≠ 真机: 弹型/关卡脚本/难度曲线完全不同, mock 通关不代表真机。
+6) 真机 `restart_process=True` 会**每局重启游戏**(约 60s 开销);
+   `--max-steps 0` 才是"只在死亡/通关时结束"。
+7) 真机 `invincible`/`bombs` 未标定; 放弹只扣 power(无独立计数)。
+8) CE 的 autorun 脚本用完必须删(`E:\Cheat Engine\autorun\zz_*.lua`)。
+9) 真机标定期必须锁血, 否则被弹瞬移会污染标定/试验。
+10) `th11.json` 的 Rank Select 是循环列表: 默认 Normal, 按 1 次"上"=Easy。
+
+------------------------------------------------------------------------
+【7. 复现命令速查】
+------------------------------------------------------------------------
+# 全部测试
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+
+# ---- mock ----
+# 全流程通关训练(熵退火+贪心评估+最佳快照)
+.\.venv\Scripts\python.exe tools\mock_full_clear.py --episodes 12000 --eval-every 600 `
+    --load .runtime\mock_full2\policy_best --out .runtime\mock_full2
+# mock 演示(动图+拼图)
+.\.venv\Scripts\python.exe tools\mock_demo.py --policy .runtime\mock_full2\policy_best --episodes 2
+# 普通训练(mock)
+.\.venv\Scripts\python.exe examples\train.py --backend mock --game th11 --difficulty 0 `
+    --hidden 256,256 --k-enemies 8 --bullet-velocity --episodes 2000 --max-steps 12000 `
+    --batch 32 --lr 8e-4 --entropy 0.02 --log-every 200 --out .runtime\mock_full2
+
+# ---- 真机 ----
+# 短验证(会重启游戏)
+.\.venv\Scripts\python.exe tools\validate_real_observation.py --train --steps 300
+# 真机 DAgger(老师=TacticalGuard)
+.\.venv\Scripts\python.exe examples\train.py --backend memory --game th11 --restart-process `
+    --teacher dagger --dagger-beta 0.25 --bullet-velocity --k-enemies 8 `
+    --episodes 6 --max-steps 4000 --step-frames 2 --lr 1e-3 --batch 1 --entropy 0.02 `
+    --log-steps --plot-every 2 --out .runtime\th11_clear\dagger1
+# 策略单独上场测"第一面"
+.\.venv\Scripts\python.exe tools\clear_stage1.py --policy <policy> --mode policy --step-frames 2 --max-steps 12000
+# 策略+老师
+.\.venv\Scripts\python.exe tools\clear_stage1.py --policy <policy> --mode guard  --step-frames 2
+# 日志分析
+.\.venv\Scripts\python.exe tools\analyze_training_log.py --dir <训练目录>
+
+------------------------------------------------------------------------
+【8. 关键文件/参数索引】
+------------------------------------------------------------------------
+- 奖励:            touhou_rl_mcp/rl/reward.py (+ config.json 的 reward 段)
+- 观测/特征:       touhou_rl_mcp/training/features.py
+                    (bullet_feature_dim / feature_dim / encode_state)
+- 观测可用性:      touhou_rl_mcp/observation.py (require_entities)
+- 实体读取:        touhou_rl_mcp/memory/entities.py (+ games/offsets/th11.json 的 entities)
+- 弹幕速度:        touhou_rl_mcp/memory/bullettrack.py
+- 终止判定:        touhou_rl_mcp/env.py (_terminal_flags / step)
+- 训练器:          touhou_rl_mcp/training/trainer.py (TrainConfig / build_action_table /
+                    _run_episode / _update_batch / _teacher_index)
+- 策略网络:        touhou_rl_mcp/training/policy.py (MLPPolicy.sample/update/imitate)
+- 老师(规则):      touhou_rl_mcp/training/tactical.py (TacticalGuard.choose)
+- 炸弹保护:        touhou_rl_mcp/inputs/bombguard.py (+ config.json 的 bomb_guard)
+- mock 物理:       touhou_rl_mcp/backends/mock.py (PLAYER_SPEED / _hit / _spawn /
+                    _update_boss / state())
+- 训练入口:        examples/train.py (--teacher/--bullet-velocity/--k-enemies/--hidden/...)
+- mock 全通关工具:  tools/mock_full_clear.py
+- 真机第一面测试:  tools/clear_stage1.py
+- 演示:            tools/mock_demo.py
+- 日志分析:        tools/analyze_training_log.py
+
+------------------------------------------------------------------------
+【9. 待办清单 (下一个会话可直接照做)】
+------------------------------------------------------------------------
+[ ] T1 统一奖励配置(A6): config.json 与 tools/mock_full_clear.py 的 REWARD 合并为一个来源
+[ ] T2 实现 A3: 无敌帧(invincible)期间不给/打折 boss_damage 与 alive_bonus
+        (mock 可直接读 game.invincible; 真机需先用 tools/find_invincible.py 标定)
+[ ] T3 调 A1/A2/A4: boss_damage_scale 1.0->0.1, miss_penalty -30->-100,
+        death_penalty -> -300, danger_scale -> 4, clip 与尺度匹配
+[ ] T4 加 F1/F2 诊断日志(不改训练逻辑), 跑一轮得出"横向动作比例/被弹上下文"
+[ ] T5 mock 加 start_stage, 做课程学习(D2), 目标贪心最远面数 3->6
+[ ] T6 动作空间加 focus(C1), 再对比一版
+[ ] T7 真机 DAgger 长跑 + speedhack 加速, 定期测"策略单独"指标
+[ ] T8 (可选) replay 数据集 + 行为克隆(E1)
+[ ] T9 把 frame 同步真的用起来(现在 frame 已标定, 但需确认 advance 走帧计数)
+[ ] T10 文档更新: README 里 th11 标定状态 / mock 非真实弹幕 的说明
+
+========================================================================

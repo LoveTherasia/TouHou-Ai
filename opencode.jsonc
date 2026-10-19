@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "timeout": {
+      "startup": 45000,
+      "catalog": 60000
+    },
+    "servers": {
+      "touhou": {
+        "type": "local",
+        "command": [
+          "E:\\TouHou-Ai\\.venv\\Scripts\\python.exe",
+          "-m",
+          "touhou_rl_mcp"
+        ],
+        "cwd": "E:\\TouHou-Ai",
+        "environment": {
+          "PYTHONUTF8": "1"
+        }
+      }
+    }
+  }
+}

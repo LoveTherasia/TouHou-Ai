@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "touhou-rl-mcp"
+version = "0.1.0"
+description = "Touhou Project RL environment exposed as an MCP server (reset / step / reward / screenshot)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["touhou", "reinforcement-learning", "mcp", "agentic-rl", "game-ai"]
+dependencies = [
+    "mcp>=2.0,<3",
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+windows = ["pywin32>=306"]
+dev = ["pywin32>=306"]
+
+[project.scripts]
+touhou-rl-mcp = "touhou_rl_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/"
+
+[tool.setuptools]
+packages = [
+    "touhou_rl_mcp",
+    "touhou_rl_mcp.backends",
+    "touhou_rl_mcp.capture",
+    "touhou_rl_mcp.games",
+    "touhou_rl_mcp.inputs",
+    "touhou_rl_mcp.memory",
+    "touhou_rl_mcp.rl",
+    "touhou_rl_mcp.training",
+]
+
+[tool.setuptools.package-data]
+"touhou_rl_mcp.games" = ["offsets/*.json"]

@@ -1,0 +1,535 @@
+"""状态 -> 特征向量.
+
+RL 智能体的输入。设计原则:
+  * **以自机为中心**: 弹幕只提供"相对自机的位移", 这样策略天然具有平移不变性,
+    换个位置也能用, 学得快得多。
+  * **按距离取最近的 K 个弹**, 并按距离排序 —— 对策略来说, "最近的那几颗弹在哪"
+    比"第 17 颗弹在哪"重要得多。
+  * 维度固定 (不足补 0 并给 valid=0), 方便接 MLP / SB3。
+
+真实后端必须有有效自机和实体观测，否则明确报错，不再静默填零训练。
+敌人位置由状态接口提供；当前兼容的 74 维策略仅编码敌人数量。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import numpy as np
+
+from ..types import PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, GameState
+from ..observation import require_entities
+
+#: 每个弹幕占的特征数: (dx, dy, 距离, 是否有效)
+BULLET_FEATURE_DIM = 4
+#: 每个弹幕额外增加的"速度"特征数: (vx, vy), 单位 像素/游戏帧
+BULLET_VELOCITY_DIM = 2
+#: 每架敌机占的特征数: (dx, dy, 距离, 是否有效)
+ENEMY_FEATURE_DIM = 4
+#: 自机/全局状态占的特征数
+GLOBAL_FEATURE_DIM = 10
+#: 速度归一化尺度 (弹速约 1~6 px/帧)
+VELOCITY_SCALE = 8.0
+
+
+def bullet_feature_dim(use_velocity: bool = False) -> int:
+    return BULLET_FEATURE_DIM + (BULLET_VELOCITY_DIM if use_velocity else 0)
+
+
+def global_feature_dim(use_invincible: bool = False, use_boss: bool = False,
+                       use_danger_grad: bool = False) -> int:
+    """全局特征维度 (可选追加 无敌帧 1 维 / Boss 位置 2 维 / 危险梯度 2 维)。"""
+    return (GLOBAL_FEATURE_DIM + (1 if use_invincible else 0)
+            + (2 if use_boss else 0) + (2 if use_danger_grad else 0))
+
+
+def feature_dim(k_bullets: int = 16, use_velocity: bool = False, k_enemies: int = 0,
+                use_invincible: bool = False, use_boss: bool = False,
+                use_danger_grad: bool = False) -> int:
+    if k_bullets < 0 or k_enemies < 0:
+        raise ValueError("k_bullets/k_enemies must be nonnegative")
+    return (global_feature_dim(use_invincible, use_boss, use_danger_grad)
+            + k_bullets * bullet_feature_dim(use_velocity) + k_enemies * ENEMY_FEATURE_DIM)
+
+
+#: 危险梯度感知半径 (与规则老师的斥力核一致)
+DANGER_GRAD_RADIUS = 30.0
+DANGER_GRAD_SCALE = 3.0
+
+
+def _danger_grad(state: GameState, px: float, py: float,
+                 radius: float = DANGER_GRAD_RADIUS) -> tuple[float, float]:
+    """最近弹幕的"斥力合成"向量 (物理启发的危险梯度)。
+
+    这正是规则老师躲弹幕时最核心的量: 把半径内每颗弹的斥力按 1/距离 加权求和。
+    作为特征给策略, 可以让"反应式躲避"这种函数更容易被 MLP 表示。
+    """
+    fx = fy = 0.0
+    for bx, by in state.bullets:
+        dx, dy = px - bx, py - by
+        d2 = dx * dx + dy * dy
+        if d2 > radius * radius:
+            continue
+        d = math.sqrt(d2) or 1.0
+        w = (radius - d) / radius / d
+        fx += dx * w
+        fy += dy * w
+    return fx, fy
+
+
+def _boss_xy(state: GameState) -> tuple[float | None, float | None]:
+    pos = (state.raw or {}).get("boss_position")
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        try:
+            return float(pos[0]), float(pos[1])
+        except (TypeError, ValueError):
+            return None, None
+    return None, None
+
+
+def encode_state(
+    state: GameState,
+    *,
+    k_bullets: int = 16,
+    use_velocity: bool = False,
+    k_enemies: int = 0,
+    use_invincible: bool = False,
+    use_boss: bool = False,
+    use_danger_grad: bool = False,
+    out: np.ndarray | None = None,
+    validate: bool = True,
+) -> np.ndarray:
+    """把一帧状态编码成定长向量 (dtype=float64)。
+
+    ``use_velocity=True`` 时每颗弹多给 (vx, vy) —— 来自 ``state.raw["bullet_velocity"]``
+    (由 :class:`~touhou_rl_mcp.memory.bullettrack.BulletTracker` 按槽位跨帧差分得到)。
+    ``k_enemies>0`` 时追加**最近的 k 架敌机**的相对位移 (dx, dy, dist, valid) ——
+    老师的瞄准/站位决策依赖敌机位置, 不给策略就学不出来。
+    """
+    if validate:
+        require_entities(state)
+    per_bullet = bullet_feature_dim(use_velocity)
+    bullet_block = k_bullets * per_bullet
+    gdim = global_feature_dim(use_invincible, use_boss, use_danger_grad)
+    px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+    py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+
+    boss_ratio = 0.0
+    if state.boss_hp is not None and state.boss_max_hp:
+        boss_ratio = max(0.0, min(1.0, state.boss_hp / max(1.0, state.boss_max_hp)))
+
+    dim = feature_dim(k_bullets, use_velocity, k_enemies, use_invincible, use_boss, use_danger_grad)
+    vec = np.empty(dim, dtype=np.float64) if out is None else out
+    vec[:GLOBAL_FEATURE_DIM] = (
+        px / PLAYFIELD_WIDTH,                                   # 自机 x
+        py / PLAYFIELD_HEIGHT,                                   # 自机 y
+        min(1.0, (state.stage or 1) / 6.0),                      # 关卡进度
+        min(1.0, (state.lives or 0) / 9.0),                      # 残机
+        min(1.0, (state.power or 0.0) / 4.0),                    # 灵力
+        min(1.0, (state.graze or 0) / 2000.0),                   # 擦弹
+        boss_ratio,                                              # Boss 血量比
+        min(1.0, (state.bullet_count or len(state.bullets)) / 150.0),  # 弹幕密度
+        1.0 if state.in_game else 0.0,                           # 是否在局内
+        min(1.0, (state.enemies_alive or 0) / 10.0),             # 敌机数量
+    )
+    if use_invincible:
+        # 无敌帧 (归一化到 150 帧): 让策略知道"现在打也没用/可以安全调整站位"
+        inv = state.invincible
+        vec[GLOBAL_FEATURE_DIM] = (
+            0.0 if inv is None else min(1.0, max(0.0, float(inv) / 150.0))
+        )
+    if use_boss:
+        # Boss 相对位置 (会移动的 Boss 必须给位置, 否则策略无法对准输出)
+        off = GLOBAL_FEATURE_DIM + (1 if use_invincible else 0)
+        bx, by = _boss_xy(state)
+        vec[off] = 0.0 if bx is None else (bx - px) / PLAYFIELD_WIDTH
+        vec[off + 1] = 0.0 if by is None else (by - py) / PLAYFIELD_HEIGHT
+    if use_danger_grad:
+        # 危险梯度 (最近弹幕的斥力合成): 让"反应式躲避"更容易被策略表示
+        off = GLOBAL_FEATURE_DIM + (1 if use_invincible else 0) + (2 if use_boss else 0)
+        gx, gy = _danger_grad(state, px, py)
+        vec[off] = float(np.clip(gx / DANGER_GRAD_SCALE, -1.0, 1.0))
+        vec[off + 1] = float(np.clip(gy / DANGER_GRAD_SCALE, -1.0, 1.0))
+
+    base = gdim
+    vec[base:] = 0.0
+    bullets = state.bullets
+    if bullets and k_bullets:
+        arr = np.asarray(bullets, dtype=np.float64).reshape(-1, 2)
+        dx = arr[:, 0] - px
+        dy = arr[:, 1] - py
+        dist2 = dx * dx + dy * dy
+        count = min(k_bullets, dx.shape[0])
+        # 取最近的 count 个 (argpartition 比 argsort 快很多)
+        if dx.shape[0] > count:
+            idx = np.argpartition(dist2, count - 1)[:count]
+            idx = idx[np.argsort(dist2[idx])]
+        else:
+            idx = np.argsort(dist2)
+        dxs = dx[idx]
+        dys = dy[idx]
+        dist = np.sqrt(dxs * dxs + dys * dys)
+        block = vec[base : base + count * per_bullet].reshape(count, per_bullet)
+        block[:, 0] = dxs / PLAYFIELD_WIDTH
+        block[:, 1] = dys / PLAYFIELD_HEIGHT
+        block[:, 2] = dist / 320.0
+        block[:, 3] = 1.0
+        if use_velocity:
+            velocities = (state.raw or {}).get("bullet_velocity") or []
+            try:
+                vel = np.asarray(velocities, dtype=np.float64).reshape(-1, 2)
+                if vel.shape[0] != arr.shape[0]:
+                    raise ValueError("velocity/bullet count mismatch")
+                block[:, 4] = vel[idx, 0] / VELOCITY_SCALE
+                block[:, 5] = vel[idx, 1] / VELOCITY_SCALE
+            except Exception:
+                block[:, 4] = 0.0
+                block[:, 5] = 0.0
+
+    # 敌机: 追加最近 k_enemies 架 (dx, dy, dist, valid) —— 老师的瞄准/站位需要它
+    if k_enemies:
+        ebase = base + bullet_block
+        enemies = state.enemy_positions
+        if enemies:
+            earr = np.asarray(enemies, dtype=np.float64).reshape(-1, 2)
+            edx = earr[:, 0] - px
+            edy = earr[:, 1] - py
+            ed2 = edx * edx + edy * edy
+            ecount = min(k_enemies, edx.shape[0])
+            if edx.shape[0] > ecount:
+                eidx = np.argpartition(ed2, ecount - 1)[:ecount]
+                eidx = eidx[np.argsort(ed2[eidx])]
+            else:
+                eidx = np.argsort(ed2)
+            eblock = vec[ebase : ebase + ecount * ENEMY_FEATURE_DIM].reshape(ecount, ENEMY_FEATURE_DIM)
+            eblock[:, 0] = edx[eidx] / PLAYFIELD_WIDTH
+            eblock[:, 1] = edy[eidx] / PLAYFIELD_HEIGHT
+            eblock[:, 2] = np.sqrt(ed2[eidx]) / 320.0
+            eblock[:, 3] = 1.0
+    return vec
+
+
+def encode_frames(
+    states: list[GameState],
+    *,
+    k_bullets: int = 16,
+    use_velocity: bool = False,
+    k_enemies: int = 0,
+    use_invincible: bool = False,
+    use_boss: bool = False,
+    use_danger_grad: bool = False,
+) -> np.ndarray:
+    out = np.empty((len(states), feature_dim(k_bullets, use_velocity, k_enemies,
+                                             use_invincible, use_boss, use_danger_grad)),
+                   dtype=np.float64)
+    for i, state in enumerate(states):
+        encode_state(state, k_bullets=k_bullets, use_velocity=use_velocity,
+                     k_enemies=k_enemies, use_invincible=use_invincible,
+                     use_boss=use_boss, use_danger_grad=use_danger_grad, out=out[i])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 空间表示: "危险图" (以自机为中心的弹幕位置栅格)
+# ---------------------------------------------------------------------------
+# 与"最近 K 颗弹的一维向量"不同, 危险图保留了**弹幕的空间分布**:
+# 把自机周围 ±span 像素的区域切成 size×size 的格子, 每格记录
+#   * 弹幕密度 (双线性 splat, 再饱和压缩)
+#   * 平均速度 (vx, vy) —— 能看出"这团弹往哪走"
+# 这样策略看到的是一张"局部地图", 而不是被排序截断的若干标量。
+
+#: 默认栅格边长 (格数)
+GRID_DEFAULT_SIZE = 16
+#: 默认栅格半径 (像素): 覆盖自机周围 ±span
+GRID_DEFAULT_SPAN = 110.0
+
+
+def grid_channels(use_velocity: bool = False) -> int:
+    """每格的通道数: 密度 1 + (可选) 速度 2。"""
+    return 1 + (BULLET_VELOCITY_DIM if use_velocity else 0)
+
+
+def grid_feature_dim(size: int = GRID_DEFAULT_SIZE, use_velocity: bool = False) -> int:
+    if size < 2:
+        raise ValueError("grid size must be >= 2")
+    return size * size * grid_channels(use_velocity)
+
+
+def grid_scales_from(spec: str | None, *, default_size: int = GRID_DEFAULT_SIZE,
+                     default_span: float = GRID_DEFAULT_SPAN) -> list[tuple[int, float]]:
+    """解析多尺度网格规格 ``"12:90,12:330"`` (= 近场 12x12/±90px + 远场 12x12/±330px)。
+
+    空串 -> 退化成单尺度 ``[(default_size, default_span)]``, 保持向后兼容。
+    """
+    scales: list[tuple[int, float]] = []
+    for part in str(spec or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        size_s, _, span_s = part.partition(":")
+        size = int(size_s)
+        if size < 2:
+            raise ValueError(f"grid size must be >= 2: {part!r}")
+        scales.append((size, float(span_s)))
+    return scales or [(int(default_size), float(default_span))]
+
+
+def grid_feature_dim_scales(scales: list[tuple[int, float]],
+                            use_velocity: bool = False) -> int:
+    """多尺度栅格的总维度 (各尺度相加)。"""
+    channels = grid_channels(use_velocity)
+    return sum(int(size) * int(size) * channels for size, _ in scales)
+
+
+def grid_observation_dim(size: int = GRID_DEFAULT_SIZE, use_velocity: bool = False,
+                         use_invincible: bool = False, use_boss: bool = False,
+                         use_danger_grad: bool = False,
+                         scales: list[tuple[int, float]] | None = None) -> int:
+    """危险图观测维度 = 栅格(可多尺度) + 全局特征 (自机/Boss/残机/无敌帧...)。"""
+    grid_dim = (grid_feature_dim_scales(scales, use_velocity) if scales
+                else grid_feature_dim(size, use_velocity))
+    return grid_dim + global_feature_dim(use_invincible, use_boss, use_danger_grad)
+
+
+def _encode_globals(vec: np.ndarray, state: GameState, px: float, py: float,
+                    use_invincible: bool, use_boss: bool,
+                    use_danger_grad: bool) -> None:
+    """把全局特征写进 ``vec`` 的前 ``global_feature_dim(...)`` 维。"""
+    boss_ratio = 0.0
+    if state.boss_hp is not None and state.boss_max_hp:
+        boss_ratio = max(0.0, min(1.0, state.boss_hp / max(1.0, state.boss_max_hp)))
+    vec[:GLOBAL_FEATURE_DIM] = (
+        px / PLAYFIELD_WIDTH,
+        py / PLAYFIELD_HEIGHT,
+        min(1.0, (state.stage or 1) / 6.0),
+        min(1.0, (state.lives or 0) / 9.0),
+        min(1.0, (state.power or 0.0) / 4.0),
+        min(1.0, (state.graze or 0) / 2000.0),
+        boss_ratio,
+        min(1.0, (state.bullet_count or len(state.bullets)) / 150.0),
+        1.0 if state.in_game else 0.0,
+        min(1.0, (state.enemies_alive or 0) / 10.0),
+    )
+    if use_invincible:
+        inv = state.invincible
+        vec[GLOBAL_FEATURE_DIM] = (
+            0.0 if inv is None else min(1.0, max(0.0, float(inv) / 150.0))
+        )
+    if use_boss:
+        off = GLOBAL_FEATURE_DIM + (1 if use_invincible else 0)
+        bx, by = _boss_xy(state)
+        vec[off] = 0.0 if bx is None else (bx - px) / PLAYFIELD_WIDTH
+        vec[off + 1] = 0.0 if by is None else (by - py) / PLAYFIELD_HEIGHT
+    if use_danger_grad:
+        off = GLOBAL_FEATURE_DIM + (1 if use_invincible else 0) + (2 if use_boss else 0)
+        gx, gy = _danger_grad(state, px, py)
+        vec[off] = float(np.clip(gx / DANGER_GRAD_SCALE, -1.0, 1.0))
+        vec[off + 1] = float(np.clip(gy / DANGER_GRAD_SCALE, -1.0, 1.0))
+
+
+def _splat_scale(state: GameState, px: float, py: float, size: int, span: float,
+                 use_velocity: bool, grid: np.ndarray, arr: np.ndarray) -> None:
+    """把 ``±span`` 窗口内的弹幕双线性 splat 进 ``grid`` (size,size,channels)。"""
+    dx = arr[:, 0] - px
+    dy = arr[:, 1] - py
+    inside = (np.abs(dx) <= span) & (np.abs(dy) <= span)
+    if not np.any(inside):
+        return
+    dxs = dx[inside]
+    dys = dy[inside]
+    gx = (dxs + span) / (2.0 * span) * (size - 1)
+    gy = (dys + span) / (2.0 * span) * (size - 1)
+    ix = np.clip(np.floor(gx).astype(np.intp), 0, size - 2)
+    iy = np.clip(np.floor(gy).astype(np.intp), 0, size - 2)
+    fx = gx - ix
+    fy = gy - iy
+    vel = None
+    if use_velocity:
+        velocities = (state.raw or {}).get("bullet_velocity") or []
+        try:
+            all_vel = np.asarray(velocities, dtype=np.float64).reshape(-1, 2)
+            if all_vel.shape[0] != arr.shape[0]:
+                raise ValueError("velocity/bullet count mismatch")
+            vel = all_vel[inside]
+        except Exception:
+            vel = None
+    dens = np.zeros((size, size), dtype=np.float64)
+    vsum = np.zeros((size, size, 2), dtype=np.float64) if vel is not None else None
+    for ox, oy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        wx = fx if ox else (1.0 - fx)
+        wy = fy if oy else (1.0 - fy)
+        w = wx * wy
+        np.add.at(dens, (iy + oy, ix + ox), w)
+        if vsum is not None:
+            np.add.at(vsum, (iy + oy, ix + ox, 0), w * vel[:, 0])
+            np.add.at(vsum, (iy + oy, ix + ox, 1), w * vel[:, 1])
+    grid[:, :, 0] = dens / (1.0 + dens)  # 饱和压缩, 避免密集处爆量
+    if vsum is not None:
+        mean = vsum / np.maximum(dens, 1e-9)[:, :, None]
+        grid[:, :, 1] = np.clip(mean[:, :, 0] / VELOCITY_SCALE, -1.0, 1.0)
+        grid[:, :, 2] = np.clip(mean[:, :, 1] / VELOCITY_SCALE, -1.0, 1.0)
+
+
+def encode_state_grid(
+    state: GameState,
+    *,
+    size: int = GRID_DEFAULT_SIZE,
+    span: float = GRID_DEFAULT_SPAN,
+    scales: list[tuple[int, float]] | None = None,
+    use_velocity: bool = True,
+    use_invincible: bool = False,
+    use_boss: bool = False,
+    use_danger_grad: bool = False,
+    out: np.ndarray | None = None,
+    validate: bool = True,
+) -> np.ndarray:
+    """把状态编码成"危险图 + 全局特征"的定长向量 (栅格在前, 全局在后)。
+
+    单尺度: 以自机为中心覆盖 ``[-span, +span]`` 像素的一张 ``size×size`` 栅格。
+
+    **多尺度** (``scales=[(12, 90), (12, 330)]``): 同时给出"近场细图"和"远场粗图",
+    各尺度依次拼接。真机弹幕统计显示: 最近弹距离中位数 ~118px, 单一 ±110px 窗口
+    **有 53% 的时间是空的** —— 远场必须单独给一层, 否则策略看不见正在飞来的弹。
+
+    双线性 splat 让弹幕位置在格子间平滑过渡, 避免"弹幕跨格时特征跳变"。
+    """
+    if validate:
+        require_entities(state)
+    resolved = scales or [(int(size), float(span))]
+    channels = grid_channels(use_velocity)
+    grid_dim = grid_feature_dim_scales(resolved, use_velocity)
+    gdim = global_feature_dim(use_invincible, use_boss, use_danger_grad)
+    vec = np.empty(grid_dim + gdim, dtype=np.float64) if out is None else out
+    px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+    py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+    _encode_globals(vec[grid_dim:], state, px, py,
+                    use_invincible, use_boss, use_danger_grad)
+
+    vec[:grid_dim] = 0.0
+    bullets = state.bullets
+    if bullets:
+        arr = np.asarray(bullets, dtype=np.float64).reshape(-1, 2)
+        off = 0
+        for gsize, gspan in resolved:
+            cells = gsize * gsize * channels
+            _splat_scale(state, px, py, gsize, gspan, use_velocity,
+                         vec[off : off + cells].reshape(gsize, gsize, channels), arr)
+            off += cells
+    return vec
+
+
+# ---------------------------------------------------------------------------
+# 统一入口: 训练器/评估脚本只需调用下面两个函数, 就能在
+#   * "最近 K 颗弹的一维向量" (旧)  与
+#   * "危险图栅格" (新, config.use_grid=True)
+# 之间切换, 而不用改任何训练逻辑。
+# ---------------------------------------------------------------------------
+
+
+def observation_dim(config: Any) -> int:
+    """按 :class:`TrainConfig` 算出观测维度 (自动区分危险图 / 最近K弹)。"""
+    if getattr(config, "use_grid", False):
+        size = getattr(config, "grid_size", GRID_DEFAULT_SIZE)
+        span = getattr(config, "grid_span", GRID_DEFAULT_SPAN)
+        scales = grid_scales_from(getattr(config, "grid_scales", ""),
+                                  default_size=size, default_span=span)
+        return grid_observation_dim(size, config.bullet_velocity, config.use_invincible,
+                                    config.use_boss, config.use_danger_grad, scales=scales)
+    return feature_dim(config.k_bullets, config.bullet_velocity, config.k_enemies,
+                       config.use_invincible, config.use_boss, config.use_danger_grad)
+
+
+class ObservationEncoder:
+    """把"观测配置"打包成一个可调用对象, 供**离线工具**使用。
+
+    工具 (demo / 真机播放 / 评估) 只要从保存的 ``policy_*.json`` 里读出 config,
+    就能自动得到正确的编码方式 —— 不用再手写一堆 ``use_boss=...`` 参数,
+    也不会在"危险图策略"上错用旧特征。::
+
+        enc = ObservationEncoder.from_meta(meta)   # meta = json["config"]
+        obs = enc(state)                           # -> np.ndarray
+        assert policy.obs_dim == enc.dim
+    """
+
+    def __init__(self, *, use_grid: bool = False,
+                 grid_size: int = GRID_DEFAULT_SIZE, grid_span: float = GRID_DEFAULT_SPAN,
+                 grid_scales: str = "",
+                 k_bullets: int = 16, bullet_velocity: bool = False, k_enemies: int = 0,
+                 use_invincible: bool = False, use_boss: bool = False,
+                 use_danger_grad: bool = False) -> None:
+        self.use_grid = bool(use_grid)
+        self.grid_size = int(grid_size)
+        self.grid_span = float(grid_span)
+        self.grid_scales = str(grid_scales or "")
+        self.k_bullets = int(k_bullets)
+        self.bullet_velocity = bool(bullet_velocity)
+        self.k_enemies = int(k_enemies)
+        self.use_invincible = bool(use_invincible)
+        self.use_boss = bool(use_boss)
+        self.use_danger_grad = bool(use_danger_grad)
+
+    @classmethod
+    def from_meta(cls, meta: dict | None = None) -> "ObservationEncoder":
+        meta = dict(meta or {})
+        return cls(
+            use_grid=bool(meta.get("use_grid", False)),
+            grid_size=int(meta.get("grid_size", GRID_DEFAULT_SIZE)),
+            grid_span=float(meta.get("grid_span", GRID_DEFAULT_SPAN)),
+            grid_scales=str(meta.get("grid_scales", "") or ""),
+            k_bullets=int(meta.get("k_bullets", 16)),
+            bullet_velocity=bool(meta.get("bullet_velocity", False)),
+            k_enemies=int(meta.get("k_enemies", 0)),
+            use_invincible=bool(meta.get("use_invincible", False)),
+            use_boss=bool(meta.get("use_boss", False)),
+            use_danger_grad=bool(meta.get("use_danger_grad", False)),
+        )
+
+    @property
+    def scales(self) -> list[tuple[int, float]]:
+        return grid_scales_from(self.grid_scales, default_size=self.grid_size,
+                                default_span=self.grid_span)
+
+    @property
+    def dim(self) -> int:
+        return observation_dim(self)
+
+    def __call__(self, state: GameState, out: np.ndarray | None = None) -> np.ndarray:
+        return encode_observation(state, self, out=out)
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        if self.use_grid:
+            scales = ",".join(f"{s}x{s}/±{sp:g}" for s, sp in self.scales)
+            return (f"ObservationEncoder(grid[{scales}] vel={self.bullet_velocity} "
+                    f"dim={self.dim})")
+        return (f"ObservationEncoder(k_bullets={self.k_bullets} vel={self.bullet_velocity} "
+                f"k_enemies={self.k_enemies} dim={self.dim})")
+
+
+def encode_observation(state: GameState, config: Any,
+                       out: np.ndarray | None = None) -> np.ndarray:
+    """按 :class:`TrainConfig` 编码一帧 (危险图或最近K弹)。"""
+    if getattr(config, "use_grid", False):
+        return encode_state_grid(
+            state,
+            size=getattr(config, "grid_size", GRID_DEFAULT_SIZE),
+            span=getattr(config, "grid_span", GRID_DEFAULT_SPAN),
+            scales=grid_scales_from(getattr(config, "grid_scales", ""),
+                                    default_size=getattr(config, "grid_size", GRID_DEFAULT_SIZE),
+                                    default_span=getattr(config, "grid_span", GRID_DEFAULT_SPAN)),
+            use_velocity=config.bullet_velocity,
+            use_invincible=config.use_invincible,
+            use_boss=config.use_boss,
+            use_danger_grad=config.use_danger_grad,
+            out=out,
+        )
+    return encode_state(
+        state,
+        k_bullets=config.k_bullets,
+        use_velocity=config.bullet_velocity,
+        k_enemies=config.k_enemies,
+        use_invincible=config.use_invincible,
+        use_boss=config.use_boss,
+        use_danger_grad=config.use_danger_grad,
+        out=out,
+    )

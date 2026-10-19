@@ -1,0 +1,349 @@
+{
+  "key": "th11",
+  "name_zh": "东方地灵殿",
+  "name_en": "Subterranean Animism",
+  "exes": [
+    "th11c.exe",
+    "th11.exe"
+  ],
+  "folder_hints": [
+    "th11",
+    "地灵殿",
+    "地霊殿",
+    "chireiden"
+  ],
+  "calibrated": true,
+  "entities": {
+    "profile": "th11-1.00a",
+    "combat": {
+      "boss": "0x1C",
+      "hp": "0x252C",
+      "flags": "0x25BC",
+      "position": "0x1070",
+      "spell_manager": "0xA8D6C",
+      "spell_id": "0x8DC",
+      "signatures": [
+        {
+          "offset": "0x1B872",
+          "bytes": "8b882c250000"
+        },
+        {
+          "offset": "0xCDC2",
+          "bytes": "f686e008000002"
+        }
+      ]
+    },
+    "player_shift": [
+      -32,
+      -16
+    ],
+    "signatures": [
+      {
+        "offset": "0xAF9A",
+        "bytes": "8b35688d4a0083c664"
+      },
+      {
+        "offset": "0xAFD4",
+        "bytes": "0fb786b2040000"
+      },
+      {
+        "offset": "0x10540",
+        "bytes": "a17c8d4a008b4068c3"
+      }
+    ],
+    "bullets": {
+      "kind": "array",
+      "pointer": "0xA8D68",
+      "array": "0x64",
+      "capacity": 2000,
+      "stride": "0x910",
+      "position": "0x43C",
+      "state": "0x4B2",
+      "active_states": [
+        1,
+        2
+      ],
+      "known_states": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "shift": [
+        192,
+        0
+      ]
+    },
+    "enemies": {
+      "kind": "linked",
+      "pointer": "0xA8D7C",
+      "head": "0x68",
+      "position": "0x1070",
+      "flags": "0x25BC",
+      "exclude_flags": "0x200020",
+      "max_nodes": 1024,
+      "shift": [
+        192,
+        0
+      ]
+    }
+  },
+  "window_size": [
+    640,
+    480
+  ],
+  "playfield": [
+    32,
+    16,
+    416,
+    464
+  ],
+  "fields": {
+    "score": {
+      "offset": "0xA56E4",
+      "type": "i32",
+      "transform": "mul10",
+      "label": "分数(内存值为1/10)"
+    },
+    "lives": {
+      "offset": "0xA5718",
+      "type": "i32",
+      "label": "残机数"
+    },
+    "power": {
+      "offset": "0xA56E8",
+      "type": "i32",
+      "transform": "div20",
+      "label": "灵力(内存值*20)"
+    },
+    "stage": {
+      "offset": "0xA5728",
+      "type": "i32",
+      "label": "当前关卡 1..6"
+    },
+    "spell_id": {
+      "offset": "0xA5730",
+      "type": "i32",
+      "label": "当前符卡/阶段编号"
+    },
+    "char_main": {
+      "offset": "0xA5710",
+      "type": "i32",
+      "label": "自机 0=灵梦 1=魔理沙"
+    },
+    "char_sub": {
+      "offset": "0xA5714",
+      "type": "i32",
+      "label": "机体 0=A 1=B 2=C"
+    },
+    "graze": {
+      "offset": "0xA5754",
+      "type": "i32",
+      "label": "擦弹数 (th11 1.00a)"
+    },
+    "bombs": {
+      "offset": null,
+      "type": "i32",
+      "label": "残机碎片/BOMB (待标定)"
+    },
+    "frame": {
+      "type": "i32",
+      "offset": "0xA5734"
+    },
+    "player_x": {
+      "type": "f32",
+      "pointer": "0xA8EB4",
+      "offsets": [
+        "0x3FC"
+      ]
+    },
+    "player_y": {
+      "type": "f32",
+      "pointer": "0xA8EB4",
+      "offsets": [
+        "0x400"
+      ]
+    },
+    "invincible": {
+      "offset": null,
+      "type": "i32",
+      "label": "无敌帧 (待标定)"
+    },
+    "boss_hp": {
+      "offset": null,
+      "type": "i32",
+      "label": "Boss血量 (待标定)"
+    },
+    "boss_max_hp": {
+      "offset": null,
+      "type": "i32",
+      "label": "Boss最大血量 (待标定)"
+    }
+  },
+  "chars": {
+    "0": "灵梦",
+    "1": "魔理沙"
+  },
+  "spells": {
+    "1": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "怪奇「钓落瓶之怪」",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "43": "罠符「捕捉之网」",
+      "44": "蜘蛛「石窟的蜘蛛之巢」",
+      "45": "瘴气「原因不明的热病」"
+    },
+    "2": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "猫符「猫步」",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "43": "妒符「绿眼怪兽」",
+      "44": "嫉妒「看不见的绿眼怪物」",
+      "45": "怨灵「恨之足」"
+    },
+    "3": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "鬼符「怪力乱神」",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "43": "怪力「大江山岚」",
+      "44": "鬼符「大江山杀戮」",
+      "45": "四天王奥义「三步必杀」"
+    },
+    "4": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "猫符「猫步」",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "27": "关底非符4",
+      "43": "想起「忒勒墨斯之光」",
+      "44": "想起「通行路径的针」",
+      "45": "想起「阴阳鬼神玉」",
+      "46": "想起「封魔针」"
+    },
+    "5": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "咒精「僵尸妖精」",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "27": "关底非符4",
+      "43": "核符「炽热物质」",
+      "44": "核热「核融合」",
+      "45": "爆符「巨型耀斑」",
+      "46": "焰星「恒星」"
+    },
+    "6": {
+      "0": "无符卡",
+      "6": "道中非符",
+      "15": "被厌恶者的哲学",
+      "24": "关底非符1",
+      "25": "关底非符2",
+      "26": "关底非符3",
+      "27": "关底非符4",
+      "28": "关底非符5",
+      "29": "关底非符6",
+      "30": "关底非符7",
+      "43": "核热「人工太阳」",
+      "44": "遮光「核热护目镜」",
+      "45": "热符「爆发日珥」",
+      "46": "恒星「红巨星」",
+      "47": "星符「巨星陨落」",
+      "48": "神火「日珥」",
+      "49": "「地狱的人工太阳」"
+    }
+  },
+  "menu_sequence": [
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 90,
+      "comment": "标题画面(=主菜单, Game Start 高亮) -> Rank Select"
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 1,
+      "hold": 6,
+      "after": 12,
+      "index_from": "difficulty",
+      "comment": "Rank Select 是循环列表: 默认 Normal, 按 1 次上=妖精級(Easy); 0=妖精 1=河童 2=天狗 3=鬼神"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 70,
+      "comment": "-> Player Select"
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 4,
+      "hold": 6,
+      "after": 10,
+      "index_from": "character",
+      "comment": "Player Select: 0=灵梦 1=魔理沙"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 70,
+      "comment": "-> Weapon Select"
+    },
+    {
+      "type": "select",
+      "direction": "down",
+      "anchor": "up",
+      "anchor_times": 4,
+      "hold": 6,
+      "after": 10,
+      "index_from": "shot",
+      "comment": "Weapon Select 循环列表，fresh process 默认 A；通过后端归零，不使用循环上键锚定"
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 70,
+      "comment": "开始游戏"
+    },
+    {
+      "type": "wait_in_game",
+      "timeout_frames": 1200
+    },
+    {
+      "type": "press",
+      "buttons": [
+        "confirm"
+      ],
+      "hold": 6,
+      "after": 20,
+      "comment": "跳过开场对话"
+    }
+  ],
+  "notes": "2026-10-17: TH11 1.00a 普通弹幕数组及敌人链表已接入 entities，代码签名匹配后只读提取。自机原始字段为窗口坐标，StateReader 减 (32,16)；弹幕/敌人加 (192,0)，统一为 384x448 场地坐标，中央出生点 (192,400)。graze 已接入。未支持激光、Boss 血量、无敌帧；未启用帧计数同步。实体观测不可用时训练/辅助躲避明确报错。菜单: 标题 -> Rank Select -> Player Select -> Weapon Select -> 开局；Rank Select 循环，新进程默认 Normal，按一次上为 Easy。Demo 也有局内读数，训练建议 restart_process=True。布局、依据与验证见 docs/TH11_ENTITIES.md。"
+}
