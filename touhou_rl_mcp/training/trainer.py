@@ -30,7 +30,7 @@ from .features import encode_observation, feature_dim, observation_dim
 from .journal import Journal
 from .policy import MLPPolicy
 
-#: 9 个方??(空字符串 = 原地不动)
+#: 9 个方向 (空字符串 = 原地不动)
 DIRECTIONS: list[str] = [
     "",
     "up",
@@ -45,10 +45,10 @@ DIRECTIONS: list[str] = [
 
 
 def build_action_table(*, use_focus: bool = False, use_bomb: bool = False) -> list[str]:
-    """构造动作表. 东方打法??一直按着射击"是常?? 所以默认始??shoot??
-    use_bomb=True 时追??9 ??放炸??动作 (方向+shoot+bomb), 这样策略**才可??*
-    学会主动放弹。注?? 炸弹是按??*边沿**触发; 连续两步都选同一 bomb 动作?? 按键
-    一直被按住不会再次触发 —??需要多次放弹时策略得穿插非 bomb 动作??
+    """构造动作表. 东方打法里"一直按着射击"是常态, 所以默认始终 shoot。
+    use_bomb=True 时追加 9 个放炸弹动作 (方向+shoot+bomb), 这样策略**才可能**
+    学会主动放弹。注意: 炸弹是按**边沿**触发; 连续两步都选同一 bomb 动作时, 按键
+    一直被按住不会再次触发 —— 需要多次放弹时策略得穿插非 bomb 动作。
     """
     table: list[str] = []
     for direction in DIRECTIONS:
@@ -75,14 +75,14 @@ def build_action_table(*, use_focus: bool = False, use_bomb: bool = False) -> li
 
 @dataclass
 class TrainConfig:
-    """训练超参 —??全部可以??MCP 在线修改."""
+    """训练超参 —— 全部可以通过 MCP 在线修改."""
 
     algorithm: str = "ppo"  # "ppo" | "reinforce_baseline"
-    episodes: int = 300  # 0 = 无限??
-    max_steps: int = 1500  # 每个 episode 最多多??step
-    step_frames: int = 4  # 每个动作持续多少??
-    #: 累积多少局再更新一次参数。REINFORCE 单局梯度方差极大, 攒几局一起更??
-    #: 是让它真正能学到东西的关??(batch=1 时基本学不动)??
+    episodes: int = 300  # 0 = 无限局
+    max_steps: int = 1500  # 每个 episode 最多多少 step
+    step_frames: int = 4  # 每个动作持续多少帧
+    #: 累积多少局再更新一次参数。REINFORCE 单局梯度方差极大, 攒几局一起更新
+    #: 是让它真正能学到东西的关键 (batch=1 时基本学不动)。
     batch_episodes: int = 8
     lr: float = 3e-3
     gamma: float = 0.99
@@ -90,12 +90,12 @@ class TrainConfig:
     value_coef: float = 0.5
     hidden: tuple[int, ...] = (64, 64)
     k_bullets: int = 16
-    #: 弹幕特征是否包含速度 (每颗??+vx,+vy; 观测??74 -> 106)。真机才有效??
+    #: 弹幕特征是否包含速度 (每颗弹 +vx,+vy; 观测 74 -> 106)。真机才有效。
     bullet_velocity: bool = False
     #: 敌机特征个数 (0=只用敌机数量; 8=追加最近 8 架敌机的相对位置)
     k_enemies: int = 0
     use_focus: bool = True
-    #: 动作空间是否包含"放炸?? (动作??9 -> 18); 默认??(旧模型是 9 动作)
+    #: 动作空间是否包含"放炸弹" (动作数 9 -> 18); 默认关 (旧模型是 9 动作)
     use_bomb: bool = False
     #: 观测是否包含无敌帧 (让策略知道"现在是否无敌"); 打开会改变 obs_dim
     use_invincible: bool = True
@@ -129,9 +129,9 @@ class TrainConfig:
     danger_weight_radius: float = 60.0
     #: 每步后 sleep 多少秒 (多线程时给真机线程让出 GIL; mock 线程建议 0.003)
     step_sleep: float = 0.0
-    #: 是否逐步??steps.jsonl 日志 (真机??6 ???? 开销可接?? mock 会很?? 慎用)
+    #: 是否逐步写 steps.jsonl 日志 (真机约 6 步/秒, 开销可接受; mock 会很大, 慎用)
     log_steps: bool = False
-    #: 老师: ""=??REINFORCE; "guard"=??TacticalGuard 选动作并做行为克??模仿学习)
+    #: 老师: ""=纯 REINFORCE; "guard"=用 TacticalGuard 选动作并做行为克隆(模仿学习)
     teacher: str = ""
     #: DAgger 模式下每步用老师动作接管的比例 (0=全策略驱动, 1=等价纯模仿)
     dagger_beta: float = 0.2
@@ -139,9 +139,9 @@ class TrainConfig:
     eval_every: int = 25
     eval_episodes: int = 3
     save_every: int = 50
-    #: 每多少局刷新一??progress.png (存活步数/面数/回报/掉残; 0 = ??
+    #: 每多少局刷新一次 progress.png (存活步数/面数/回报/掉残; 0 = 关)
     plot_every: int = 10
-    #: 每多少局抓一帧画??(供可视化; 0 = 不抓)
+    #: 每多少局抓一帧画面 (供可视化; 0 = 不抓)
     capture_every: int = 5
     difficulty: int = 1
     character: int = 0
@@ -191,7 +191,7 @@ class EpisodeRecord:
     eval: bool = False
     character: int = 0
     shot: int = 0
-    #: 本局各动作被选中的次??(便于看它爱用什么动??/ 有没有放??
+    #: 本局各动作被选中的次数 (便于看它爱用什么动作 / 有没有放弹)
     actions: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -237,7 +237,7 @@ class Trajectory:
 
 
 class Trainer:
-    """后台线程里跑 RL 训练, 对外暴露状态查??/ 在线调参 / 保存加载."""
+    """后台线程里跑 RL 训练, 对外暴露状态查询 / 在线调参 / 保存加载."""
 
     def __init__(
         self,
@@ -301,7 +301,7 @@ class Trainer:
         self.error: str | None = None
         self.current_episode: dict[str, Any] = {}
         self._last_update: dict[str, float] = {}
-        #: 最近一次抓到的画面 (PIL Image), 供监视窗??/ MCP 仪表盘使??
+        #: 最近一次抓到的画面 (PIL Image), 供监视窗口 / MCP 仪表盘使用
         self.latest_frame: Any = None
         self.latest_frame_episode: int = 0
         self._last_frame_save = 0.0
@@ -357,7 +357,7 @@ class Trainer:
     # 在线调参
     # ------------------------------------------------------------------
     def reconfigure(self, patch: dict[str, Any]) -> dict[str, Any]:
-        """修改训练超参; 需要重建网络的??(hidden/k_bullets/use_focus) 会重建策??"""
+        """修改训练超参; 需要重建网络的项 (hidden/k_bullets/use_focus) 会重建策略。"""
         new_config = TrainConfig.from_dict({**self.config.to_dict(), **patch})
         rebuild = (
             new_config.hidden != self.config.hidden
@@ -392,7 +392,7 @@ class Trainer:
         return {"config": new_config.to_dict(), "rebuilt_policy": rebuild}
 
     # ------------------------------------------------------------------
-    # 训练主循??
+    # 训练主循环
     # ------------------------------------------------------------------
     def _loop(self) -> None:
         try:
@@ -494,7 +494,7 @@ class Trainer:
         # 但每步都用老师对其**实际访问到的状态**打标签 -> 修正 BC 的分布漂移。
         dagger_beta = float(getattr(config, "dagger_beta", 0.2)) if teacher == "dagger" else 1.0
 
-        # max_steps <= 0 表示不限?? 一局只在真正 game over / clear 时结??
+        # max_steps <= 0 表示不限长; 一局只在真正 game over / clear 时结束
         step_limit = int(config.max_steps) if config.max_steps and config.max_steps > 0 else None
         step_index = -1
         while True:
@@ -682,13 +682,13 @@ class Trainer:
         self,
         batch: list[Trajectory],
     ) -> dict[str, float]:
-        """把攒下来的几局拼成一个大 batch, 统一算优势并更新一次参??"""
+        """把攒下来的几局拼成一个大 batch, 统一算优势并更新一次参数。"""
         algorithm = (self.config.algorithm or "").strip().lower()
         if algorithm == "ppo" and not (self.config.teacher or "").strip():
             return self._update_ppo(batch)
 
         if (self.config.teacher or "").strip():
-            # 模仿学习: 直接交叉熵拟??老师动作", 不用回报/优势
+            # 模仿学习: 直接交叉熵拟合老师动作, 不用回报/优势
             obs_all: list[np.ndarray] = []
             act_all: list[int] = []
             w_all: list[float] = []
@@ -831,7 +831,7 @@ class Trainer:
         return summary
 
     def _capture_frame(self, index: int) -> None:
-        """抓一帧当前画??(供可视化 / 监视窗口 / MCP 仪表??."""
+        """抓一帧当前画面 (供可视化 / 监视窗口 / MCP 仪表盘)."""
         try:
             with self.env_lock:
                 frame = self.env.capture_frame()
@@ -848,7 +848,7 @@ class Trainer:
 
             path = save_png(frame, self.out_dir / "frames", name="latest.png")
             self.artifacts["frame"] = str(path)
-            # 同时刷新仪表??(画面 + 曲线 + 统计), 训练过程中随时可以打开??
+            # 同时刷新仪表盘 (画面 + 曲线 + 统计), 训练过程中随时可以打开。
             dashboard = self.dashboard_image()
             dash_path = save_png(dashboard, self.out_dir, name="dashboard.png")
             self.artifacts["dashboard"] = str(dash_path)
@@ -856,7 +856,7 @@ class Trainer:
             pass
 
     def _refresh_curve(self, *, force: bool = False) -> None:
-        """把学习曲线画出来落盘 (节流: 最??2 秒一??."""
+        """把学习曲线画出来落盘 (节流: 最多 2 秒一次)."""
         now = time.perf_counter()
         if not force and now - self._last_curve_save < 2.0:
             return
@@ -887,7 +887,7 @@ class Trainer:
             pass
 
     def progress_image(self):
-        """存活步数/面数/回报/掉残 四联??(供外部调??."""
+        """存活步数/面数/回报/掉残 四联图 (供外部调用)."""
         from .visualize import draw_progress
 
         return draw_progress(self.episodes, title="训练进度 (存活步数 / 面数 / 回报 / 掉残)")
@@ -900,7 +900,7 @@ class Trainer:
             self.latest_frame,
             self.episodes,
             self.status(tail=4),
-            title=title or f"Touhou RL 训练仪表??· {self.config.algorithm}",
+            title=title or f"Touhou RL 训练仪表盘 · {self.config.algorithm}",
         )
 
     def curve_image(self):
@@ -967,7 +967,7 @@ class Trainer:
         target = Path(path) if path else self.policy_path()
         npz = target.with_suffix(".npz")
         if not npz.exists():
-            raise FileNotFoundError(f"找不到策略文?? {npz}")
+            raise FileNotFoundError(f"找不到策略文件: {npz}")
         loaded = MLPPolicy.load(npz)
         if loaded.obs_dim != self.obs_dim or loaded.n_actions != len(self.action_table):
             raise ValueError("Checkpoint observation/action dimensions do not match training config")
