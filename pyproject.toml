@@ -8,8 +8,20 @@ version = "0.1.0"
 description = "Touhou Project RL environment exposed as an MCP server (reset / step / reward / screenshot)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 keywords = ["touhou", "reinforcement-learning", "mcp", "agentic-rl", "game-ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Games/Entertainment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "mcp>=2.0,<3",
     "pillow>=10.0",
@@ -17,8 +29,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-windows = ["pywin32>=306"]
-dev = ["pywin32>=306"]
+windows = ["pywin32>=306 ; sys_platform == 'win32'"]
+dev = ["ruff>=0.6", "pywin32>=306 ; sys_platform == 'win32'"]
 
 [project.scripts]
 touhou-rl-mcp = "touhou_rl_mcp.__main__:main"
@@ -40,3 +52,18 @@ packages = [
 
 [tool.setuptools.package-data]
 "touhou_rl_mcp.games" = ["offsets/*.json"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", ".runtime", "archive", "native"]
+
+[tool.ruff.lint]
+# 只启用"一定是 bug"的规则 (语法错误 / 未定义名 / 未使用变量)。
+# 风格类规则暂不启用，避免历史代码产生大量噪声。
+select = ["E9", "F"]
+ignore = ["F401", "F841"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

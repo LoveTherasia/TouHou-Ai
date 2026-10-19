@@ -1,5 +1,4 @@
 mcp>=2.0,<3
-pymem>=1.13 ; extra == "memory"
 pillow>=10.0
 numpy>=1.26
 pywin32>=306 ; sys_platform == "win32"
