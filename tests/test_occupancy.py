@@ -1,0 +1,110 @@
+"""占用栅格 / 几何缺口观测的契约测试。
+
+这些断言固定的是**语义**, 不是实现细节: 缺口必须被识别成最安全的一列、
+场地外的列不能伪装成安全区、弹速必须参与外推。改动编码器时如果这些挂了,
+说明策略看到的世界已经变了。
+"""
+
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+
+from touhou_rl_mcp.training.occupancy import (
+    GapObservation, GapSpec, _bullets, _tta_profile,
+)
+from touhou_rl_mcp.types import GameState
+
+
+def _wall_state(px: float, py: float, *, hole_x: float, hole_width: float,
+                wall_y: float, vy: float = 1.8) -> GameState:
+    bullets = []
+    x = 12.0
+    while x <= 372.0:
+        if abs(x - hole_x) >= hole_width / 2.0:
+            bullets.append((x, wall_y))
+        x += 9.0
+    return GameState(
+        frame=100, in_game=True, player_x=px, player_y=py, lives=2,
+        bullets=bullets,
+        raw={"bullet_velocity": [(0.0, vy)] * len(bullets)},
+    )
+
+
+class GapSpecTest(unittest.TestCase):
+    def test_dim_is_stable(self) -> None:
+        for spec in (GapSpec(), GapSpec(use_grid=False), GapSpec(use_geo=False)):
+            enc = GapObservation(spec)
+            state = _wall_state(192.0, 416.0, hole_x=256.0, hole_width=60.0, wall_y=300.0)
+            obs = enc(state)
+            self.assertEqual(obs.shape[0], enc.dim)
+            self.assertEqual(enc.dim, GapObservation(spec).dim)
+
+    def test_velocity_is_read_from_state(self) -> None:
+        state = _wall_state(192.0, 416.0, hole_x=256.0, hole_width=60.0, wall_y=300.0)
+        _pos, vel = _bullets(state)
+        self.assertTrue(np.allclose(vel[:, 1], 1.8))
+
+
+class TtaProfileTest(unittest.TestCase):
+    spec = GapSpec()
+
+    def test_gap_is_the_safest_column(self) -> None:
+        px, py = 192.0, 416.0
+        state = _wall_state(px, py, hole_x=px + 64.0, hole_width=60.0, wall_y=py - 200.0)
+        pos, vel = _bullets(state)
+        profile = _tta_profile(px, py, pos, vel, self.spec)
+        col = int(np.argmax(profile))
+        expected_x = px - self.spec.span_x + (col + 0.5) * 2 * self.spec.span_x / self.spec.tta_cols
+        # 识别到的缺口必须落在真实缺口内 (允许一个格子的量化误差)
+        self.assertLessEqual(abs(expected_x - (px + 64.0)), 30.0 + 1e-6)
+
+    def test_offscreen_columns_are_not_safe(self) -> None:
+        px, py = 192.0, 416.0
+        state = _wall_state(px, py, hole_x=px + 64.0, hole_width=60.0, wall_y=py - 200.0)
+        pos, vel = _bullets(state)
+        profile = _tta_profile(px, py, pos, vel, self.spec)
+        # 场地外的列 (自机被夹在 [8, 376]) 必须判为危险, 否则策略会学成贴边
+        self.assertEqual(float(profile[0]), 0.0)
+        self.assertEqual(float(profile[-1]), 0.0)
+
+    def test_faster_bullets_arrive_earlier(self) -> None:
+        px, py = 192.0, 416.0
+        slow, _ = _bullets(_wall_state(px, py, hole_x=px + 64.0, hole_width=60.0,
+                                       wall_y=py - 200.0, vy=0.5))
+        fast, _ = _bullets(_wall_state(px, py, hole_x=px + 64.0, hole_width=60.0,
+                                       wall_y=py - 200.0, vy=2.5))
+        prof = _tta_profile(px, py, slow, np.zeros_like(slow), self.spec)
+        prof_slow = prof.copy()
+        prof_fast = _tta_profile(px, py, fast, np.full_like(fast, 2.5), self.spec)
+        # 快弹更早到达 -> 同一列的安全值更低
+        self.assertLess(float(prof_fast.mean()), float(prof_slow.mean()))
+
+    def test_no_bullets_is_all_clear(self) -> None:
+        profile = _tta_profile(192.0, 416.0, np.zeros((0, 2)), np.zeros((0, 2)), self.spec)
+        reachable = slice(1, self.spec.tta_cols - 1)
+        self.assertTrue(np.all(profile[reachable] == 1.0))
+
+
+class ObservationTest(unittest.TestCase):
+    def test_obs_is_deterministic(self) -> None:
+        enc = GapObservation()
+        state = _wall_state(192.0, 416.0, hole_x=240.0, hole_width=60.0, wall_y=300.0)
+        a = enc(state).copy()
+        b = enc(state, prev_action=3).copy()
+        self.assertFalse(np.allclose(a, b))      # 上一动作影响了输入
+        self.assertTrue(np.allclose(enc(state), a))
+
+    def test_prev_action_one_hot(self) -> None:
+        spec = GapSpec(use_grid=False, use_geo=False, use_clearance=False)
+        enc = GapObservation(spec)
+        state = _wall_state(192.0, 416.0, hole_x=240.0, hole_width=60.0, wall_y=300.0)
+        obs = enc(state, prev_action=5)
+        self.assertEqual(enc.dim, 7 + 9)               # 7 维全局 + 9 维 one-hot
+        self.assertEqual(float(obs[7 + 5]), 1.0)
+        self.assertAlmostEqual(float(obs[7:].sum()), 1.0, places=6)
+
+
+if __name__ == "__main__":
+    unittest.main()

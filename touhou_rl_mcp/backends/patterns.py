@@ -214,6 +214,42 @@ class WallGap(Pattern):
                 game.spawn(24.0 + i * step, self.y, 0.0, self.speed)
 
 
+class WallGate(Pattern):
+    """密集弹幕墙 + 单缺口 (找缝的标准场景)。
+
+    与 ``wall_gap`` 的区别: 这里的墙是**真的封死**的 —— 弹间距 ``spacing`` 小于
+    2*(弹半径+判定半径), 除了缺口以外没有任何缝隙可钻。每 ``interval`` 帧一堵墙,
+    缺口位置按 ``gap_drift`` 横向移动, 所以自机必须**提前若干帧**开始横向占位,
+    而不能等墙到了再躲。
+
+    ``gap_phase`` 用来生成训练集之外的缺口相位, 检验策略是否真的"看懂了缺口"。
+    """
+
+    name = "wall_gate"
+    spacing = 9.0        # 弹间距 (px); 9 - 2*3 = 3px 空隙 < 判定直径, 钻不过去
+    speed = 1.9          # 下落速度 (px/帧)
+    interval = 55        # 每多少帧一堵墙
+    gap_width = 48.0     # 缺口宽度 (px)
+    gap_phase = 0.0      # 初始缺口横向相位 (0~1)
+    gap_drift = 0.17     # 每堵墙缺口横移比例 (× 可用宽度)
+    y = 108.0
+    x_min = 12.0
+
+    def update(self, game: Any) -> None:
+        if game.frame % self.interval:
+            return
+        wave = game.frame // self.interval
+        free = PLAYFIELD_WIDTH - 2 * self.x_min
+        phase = (float(self.gap_phase) + wave * float(self.gap_drift)) % 1.0
+        gap_x = self.x_min + phase * free
+        count = int(free / self.spacing) + 1
+        for i in range(count):
+            x = self.x_min + i * self.spacing
+            if abs(x - gap_x) < self.gap_width / 2.0:
+                continue
+            game.spawn(x, self.y, 0.0, self.speed)
+
+
 class ClosingRing(Pattern):
     """闭合环 (收网): 以自机为中心生成一圈向内收缩的弹幕, 只留一个缺口。
 
@@ -228,6 +264,7 @@ class ClosingRing(Pattern):
     speed = 1.0          # 向内收缩速度 (px/帧)
     interval = 160       # 每多少帧收一层网
     gap_slots = 2        # 缺口占几个槽位
+    gap_phase = 0        # 初始缺口槽位 (换一个值 = 未见过的相位, 用于泛化测试)
     start = 60           # 开局多少帧后开始
 
     def update(self, game: Any) -> None:
@@ -236,7 +273,7 @@ class ClosingRing(Pattern):
         if (game.frame - self.start) % self.interval:
             return
         layer = (game.frame - self.start) // self.interval
-        gap = layer % self.count
+        gap = (layer + int(self.gap_phase)) % self.count
         cx, cy = game.px, game.py
         for i in range(self.count):
             if (i - gap) % self.count < self.gap_slots:
@@ -245,6 +282,46 @@ class ClosingRing(Pattern):
             x = min(PLAYFIELD_WIDTH - 8.0, max(8.0, cx + math.cos(a) * self.radius))
             y = min(PLAYFIELD_HEIGHT - 16.0, max(32.0, cy + math.sin(a) * self.radius))
             game.spawn(x, y, -math.cos(a) * self.speed, -math.sin(a) * self.speed)
+
+
+class RingGate(Pattern):
+    """扩张环 + 旋转缺口: 固定圆心向外扩散, 缺口每层转动。
+
+    与 ``closing_ring``(围着自机收网) 的区别: 圆心固定在画面上方, 环向外扩张**经过**
+    自机。所以自机要么提前横向对齐缺口, 要么在环到达前**上穿**过去 —— 这正是正作
+    里"环形弹幕找缝"的标准形态。
+
+    缺口按 ``drift`` 个槽位逐层旋转, 因此"记住上一层缺口在哪"没有意义, 必须看当前
+    这一层的角度。``gap_phase`` 用来生成训练集之外的角度相位, 检验是否真的学会了
+    "找缝"而不是背下了某个固定方向。
+    """
+
+    name = "ring_gate"
+    count = 48
+    speed = 1.4          # 扩张速度 (px/帧)
+    interval = 110       # 每多少帧放一层
+    gap_slots = 4        # 缺口占几个槽位
+    drift = 3            # 每层缺口旋转多少槽位 (可正可负)
+    gap_phase = 0        # 初始缺口槽位 (泛化测试用)
+    spawn_radius = 20.0  # 出生半径 (避免同点爆散)
+    x = CX
+    y = 120.0
+    start = 40
+
+    def update(self, game: Any) -> None:
+        if game.frame < self.start:
+            return
+        if (game.frame - self.start) % self.interval:
+            return
+        layer = (game.frame - self.start) // self.interval
+        gap = (int(self.gap_phase) + layer * int(self.drift)) % self.count
+        for i in range(self.count):
+            if (i - gap) % self.count < self.gap_slots:
+                continue
+            a = 2.0 * math.pi * i / self.count
+            game.spawn(self.x + math.cos(a) * self.spawn_radius,
+                       self.y + math.sin(a) * self.spawn_radius,
+                       math.cos(a) * self.speed, math.sin(a) * self.speed)
 
 
 class RandomSpray(Pattern):
@@ -305,7 +382,7 @@ class AimedSpread(Pattern):
 _REGISTRY: dict[str, type[Pattern]] = {
     c.name: c for c in (
         DenseRing, ExpandingHomingRing, AimedTrail, StaticSwarm,
-        Spiral, Fan, WallGap, ClosingRing, RandomSpray, Flower, AimedSpread,
+        Spiral, Fan, WallGap, WallGate, ClosingRing, RingGate, RandomSpray, Flower, AimedSpread,
     )
 }
 
@@ -319,6 +396,8 @@ PATTERN_DOCS: dict[str, str] = {
     "fan": "向下扇形",
     "wall_gap": "带缺口的横向弹幕墙",
     "closing_ring": "闭合环: 围着自机收网, 只留一个缺口, 必须找缝穿出",
+    "wall_gate": "密集弹幕墙 + 单缺口: 墙真的封死, 必须提前横向占位",
+    "ring_gate": "扩张环 + 旋转缺口: 圆心固定, 环扩过自机, 必须横向对齐或上穿",
     "random_spray": "随机爆散",
     "flower": "n 重对称花弹",
     "aimed_spread": "自机狙 n 连",

@@ -101,6 +101,19 @@ native/speedhack/  32 位时间缩放钩子（可选，需自行构建）
 `V(s)`/策略（future occupancy 观测 + PPO，或用学习到的 V 给搜索做 bootstrap），
 而不是继续堆搜索规则。`MacroPlanner` 目前仅作实验脚手架，不接入训练老师。
 
+> ⚠️ 上述结论有一部分被后续发现的 bug 影响：`memory/bullettrack.py` 曾无条件覆盖
+> `bullet_velocity`，在 mock 上没有槽位信息时把所有弹速写成 0，导致"时空搜索"实际
+> 推演的是一群静止弹。该 bug 已修复（`tests/test_memory_reader.py` 有回归测试），
+> `planner.py` 的基准需要在修复后重跑一次才算数。
+
+#### P2 可行性验证 · 二（2026-10-19，缺口任务）
+
+新增 `wall_gate`（真能封死的弹幕墙 + 单缺口）与 `training/occupancy.py`
+（时间分层占用栅格 + 每列最早到达时间 TTA 剖面），在 `tools/gap_rl.py` 里做
+"表示 / 密集信号 / 信任域"三层对照。**结论：几何缺口 + 占用栅格可行**，
+但必须配套弱监督与 BC 锚，纯 RL 会坍缩成"不动"。完整数据见
+[`docs/GAP_LEARNING.md`](GAP_LEARNING.md)。
+
 ### P3 · 真机与多作品
 
 - 真机鲁棒性：进程/窗口/焦点看门狗，异常自动复位。

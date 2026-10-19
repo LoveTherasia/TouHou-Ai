@@ -48,10 +48,22 @@ class BulletTracker:
                     vx = vy = 0.0  # 槽位回收/换弹, 不可信
             velocities.append((vx, vy))
 
+        # 后端**自带**弹速时 (mock 的 Bullet 有 vx/vy, 但没有 active_slots),
+        # 必须原样保留 —— 否则差分得到的全 0 会覆盖掉真实速度,
+        # 让所有"弹道外推"类观测 (占用栅格 / 规划器 / 危险梯度) 全部失效。
+        if not slots:
+            provided = None
+            if isinstance(getattr(state, "raw", None), dict):
+                provided = state.raw.get("bullet_velocity")
+            if isinstance(provided, (list, tuple)) and len(provided) == len(bullets):
+                self._prev = {i: (float(x), float(y)) for i, (x, y) in enumerate(bullets)}
+                self._prev_frame = frame
+                return state
+
         # 记录本帧 (键用槽位; 没有槽位信息时退化为按序号)
         if slots:
             self._prev = {int(slot): (float(x), float(y))
-                          for slot, (x, y) in zip(slots, bullets) if i < len(bullets)}
+                          for slot, (x, y) in zip(slots, bullets)}
         else:
             self._prev = {i: (float(x), float(y)) for i, (x, y) in enumerate(bullets)}
         self._prev_frame = frame

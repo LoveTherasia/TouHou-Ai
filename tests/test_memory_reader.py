@@ -161,5 +161,42 @@ class TestStateReader(unittest.TestCase):
         self.assertEqual(th11.spell_name(6, 49), "「地狱的人工太阳」")
 
 
+class BulletTrackerTest(unittest.TestCase):
+    """速度追踪器: 不能被"差分出全 0"覆盖掉后端自带的权威弹速。
+
+    mock 后端没有 ``active_slots``, 一旦被覆盖, 所有依赖弹道外推的观测
+    (占用栅格 / 规划器 / 危险梯度) 都会把弹幕当成静止的 —— 曾经真实发生过。
+    """
+
+    def test_keeps_backend_velocity_when_no_slots(self) -> None:
+        from touhou_rl_mcp.memory.bullettrack import BulletTracker
+        from touhou_rl_mcp.types import GameState
+
+        tracker = BulletTracker()
+        first = GameState(frame=1, bullets=[(10.0, 20.0)],
+                          raw={"bullet_velocity": [(0.0, 1.9)]})
+        tracker.update(first)
+        self.assertEqual(first.raw["bullet_velocity"], [(0.0, 1.9)])
+
+        second = GameState(frame=2, bullets=[(10.0, 21.9)],
+                           raw={"bullet_velocity": [(0.0, 1.9)]})
+        tracker.update(second)
+        self.assertEqual(second.raw["bullet_velocity"], [(0.0, 1.9)])
+
+    def test_memory_slots_are_differenced(self) -> None:
+        from touhou_rl_mcp.memory.bullettrack import BulletTracker
+        from touhou_rl_mcp.types import GameState
+
+        tracker = BulletTracker()
+        raw = {"entities": {"bullets": {"active_slots": [7]}}}
+        tracker.update(GameState(frame=10, bullets=[(100.0, 100.0)], raw=dict(raw)))
+        state = GameState(frame=12, bullets=[(104.0, 100.0)],
+                          raw={"entities": {"bullets": {"active_slots": [7]}}})
+        tracker.update(state)
+        vx, vy = state.raw["bullet_velocity"][0]
+        self.assertAlmostEqual(vx, 2.0)      # (104-100)/(12-10)
+        self.assertAlmostEqual(vy, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
