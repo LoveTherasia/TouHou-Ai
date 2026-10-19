@@ -19,7 +19,9 @@
 * **只输出测量, 不输出决策**。"缺口中心 x / 宽度 / 最早到达时间"是观测量;
   "该往左还是往右"必须由策略自己学。把决策写进特征 = 把人工控制器塞进输入,
   策略就退化成"复读机", 换个弹型立刻失效。
-* **以自机为中心**, 保证平移不变性 (换个站位仍然有效)。
+* **横向覆盖整个场地, 纵向以自机为原点**。场宽固定 384px, 所以横向用绝对车道;
+  纵向关心的是"我上方的弹什么时候到", 用相对窗口更省维度。纯相对窗口的问题是
+  一堵全屏宽的弹墙可能在窗口外留缝, 策略于是"看不见"半个屏幕的缺口。
 * 全部向量化, 单帧开销亚毫秒级, 真机 60Hz 也扛得住。
 
 用法::
@@ -55,14 +57,13 @@ class GapSpec:
 
     #: 占用栅格的未来时刻 (帧)
     horizons: tuple[int, ...] = (0, 12, 26)
+    #: 栅格: 横向覆盖**整个场地** (384px / cols), 纵向以自机为原点
     rows: int = 10
-    cols: int = 13
-    #: 栅格覆盖范围: 横向 ±span_x, 纵向上方 span_up / 下方 span_down
-    span_x: float = 208.0
+    cols: int = 24
     span_up: float = 300.0
     span_down: float = 56.0
-    #: 每列最早到达时间剖面的列数与纵向带宽
-    tta_cols: int = 24
+    #: TTA 剖面: 全场地 ``tta_cols`` 条车道 (12px/条), 纵向带宽 tta_band
+    tta_cols: int = 32
     tta_band: float = 26.0
     tta_horizon: int = 240
     tta_step: int = 3
@@ -92,13 +93,17 @@ def _bullets(state: GameState) -> tuple[np.ndarray, np.ndarray]:
 
 def _grid_layers(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
                  spec: GapSpec, out: np.ndarray) -> None:
-    """把各未来时刻的弹幕位置写进占用栅格 (层, rows, cols)。"""
+    """把各未来时刻的弹幕位置写进占用栅格 (层, rows, cols)。
+
+    横向覆盖整个场地而不是"自机附近": 一堵全屏宽的弹墙, 缺口可能在任何一侧, 只看
+    ±200px 会直接看不见它 —— 那策再怎么学也躲不开。
+    """
     out.fill(0.0)
     if pos.shape[0] == 0:
         return
-    width = 2.0 * spec.span_x
+    width = float(PLAYFIELD_WIDTH)
     height = spec.span_up + spec.span_down
-    x0 = px - spec.span_x
+    x0 = 0.0
     y0 = py - spec.span_up
     for li, t in enumerate(spec.horizons):
         xs = pos[:, 0] + vel[:, 0] * t
@@ -110,7 +115,7 @@ def _grid_layers(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
             out[li, iy[ok], ix[ok]] = 1.0
 
 
-def _tta_profile(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
+def _tta_profile(py: float, pos: np.ndarray, vel: np.ndarray,
                  spec: GapSpec) -> np.ndarray:
     """每列"最早被弹幕威胁"的时间 (帧), 归一化到 [0, 1], 越接近 1 越安全。
 
@@ -126,10 +131,7 @@ def _tta_profile(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
     单调性同样重要: ``1/(1+t)`` 是递减的, 会把缺口变成最低点, 语义正好相反。
     """
     cols = spec.tta_cols
-    width = 2.0 * spec.span_x
-    cell = width / cols
-    x0 = px - spec.span_x
-    centers = x0 + (np.arange(cols) + 0.5) * cell
+    centers = _column_centers(spec)
     reach = HITBOX_RADIUS + BULLET_RADIUS
     never = float(spec.tta_horizon + spec.tta_step)
     tta = np.full(cols, never)
@@ -143,7 +145,8 @@ def _tta_profile(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
     ts = np.arange(0, spec.tta_horizon + 1, spec.tta_step, dtype=np.float64)
     xs = pos[:, 0][None, :] + vel[:, 0][None, :] * ts[:, None]
     ys = pos[:, 1][None, :] + vel[:, 1][None, :] * ts[:, None]
-    hot = (np.abs(ys - py) <= spec.tta_band) & (np.abs(xs - px) <= spec.span_x + reach)
+    hot = (np.abs(ys - py) <= spec.tta_band) & (xs >= -reach) & \
+          (xs <= PLAYFIELD_WIDTH + reach)
     if not np.any(hot):
         return np.clip(tta / spec.tta_horizon, 0.0, 1.0)
     first = np.argmax(hot, axis=0)              # 每颗弹首次进入带宽的时刻下标
@@ -159,16 +162,40 @@ def _tta_profile(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
     return np.clip(tta / spec.tta_horizon, 0.0, 1.0)
 
 
-def _gap_features(profile: np.ndarray) -> np.ndarray:
+def _column_centers(spec: GapSpec) -> np.ndarray:
+    """每条车道的中心 x (场地绝对坐标, 与自机位置无关)。"""
+    cell = float(PLAYFIELD_WIDTH) / spec.tta_cols
+    return (np.arange(spec.tta_cols) + 0.5) * cell
+
+
+def _best_column(profile: np.ndarray, px: float, spec: GapSpec) -> int:
+    """剖面最大值中**离自机最近**的那条车道。
+
+    不能直接用 ``np.argmax``: "整片都安全"时所有车道都被截到 1.0, argmax 会返回
+    第 0 条, 于是"缺口"永远在最左边 —— 自机于是持续贴左墙, 而这恰恰是最容易被弹的
+    死法。改成在并列最优里挑最近的车道, 语义变成"没必要动就别动"。
+    """
+    centers = _column_centers(spec)
+    top = float(profile.max()) if profile.size else 0.0
+    tied = np.flatnonzero(profile >= top - 1e-9)
+    if not tied.size:
+        return profile.size // 2
+    return int(tied[np.argmin(np.abs(centers[tied] - px))])
+
+
+def _gap_features(profile: np.ndarray, px: float, spec: GapSpec) -> np.ndarray:
     """从 TTA 剖面提取"缺口"的几何量 (4 维, 全是测量)。
 
     * 缺口中心的横向位置 (相对自机, 用 sin/cos 避免 ±π 跳变)
     * 缺口的安全余量 (归一化到 [0,1])
     * 缺口宽度 (占屏宽比例)
+
+    注意这里的中心是**相对位置**: 传进来的 profile 以自机为中心, 所以中点是自机
+    自己。整片安全时中心应当落在 0 附近 (无缺口可追), 而不是某个远端列。
     """
     n = profile.shape[0]
-    k = int(np.argmax(profile))
-    # 环形相邻的"较安全"连续段宽度
+    k = _best_column(profile, px, spec)
+    # 相邻的"较安全"连续段宽度
     thresh = max(0.55 * float(profile[k]), 0.02)
     width = 1
     for direction in (-1, 1):
@@ -176,10 +203,11 @@ def _gap_features(profile: np.ndarray) -> np.ndarray:
         while 0 <= j + direction < n and profile[j + direction] >= thresh:
             j += direction
             width += 1
-    rel = (k + 0.5) / n - 0.5                       # [-0.5, 0.5)
-    ang = rel * 2.0 * math.pi
+    dx = (_column_centers(spec)[k] - px) / (PLAYFIELD_WIDTH / 2.0)   # 约 [-1, 1]
+    dx = float(max(-1.0, min(1.0, dx)))
     return np.array([
-        math.sin(ang), math.cos(ang),
+        math.sin(dx * math.pi / 2.0),                  # 缺口在左/右 (平滑, 无跳变)
+        1.0 - abs(dx),                                 # 缺口在正前方的程度
         float(profile[k]),
         width / n,
     ], dtype=np.float64)
@@ -253,10 +281,10 @@ class GapObservation:
             _grid_layers(px, py, pos, vel, spec, grid)
             off += cells
         if spec.use_geo:
-            profile = _tta_profile(px, py, pos, vel, spec)
+            profile = _tta_profile(py, pos, vel, spec)
             vec[off:off + spec.tta_cols] = profile
             off += spec.tta_cols
-            vec[off:off + 4] = _gap_features(profile)
+            vec[off:off + 4] = _gap_features(profile, px, spec)
             off += 4
         if spec.use_clearance:
             c6 = _clearances(px, py, pos, vel, 6)
@@ -295,6 +323,5 @@ class GapProbe:
 
     def profile(self, state: GameState) -> np.ndarray:
         pos, vel = _bullets(state)
-        px = float(state.player_x or PLAYFIELD_WIDTH / 2)
         py = float(state.player_y or PLAYFIELD_HEIGHT - 32)
-        return _tta_profile(px, py, pos, vel, self.spec)
+        return _tta_profile(py, pos, vel, self.spec)

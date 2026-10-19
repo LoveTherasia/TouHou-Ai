@@ -31,7 +31,10 @@
         <h1 id="run-name">选择左侧的一次训练</h1>
         <p id="run-path" class="muted">run = 任何包含 train.jsonl 的目录</p>
       </div>
-      <div id="chips" class="chips"></div>
+      <div class="head-side">
+        <button id="launch-open" class="primary" title="从白名单实验里起一次训练">启动训练</button>
+        <div id="chips" class="chips"></div>
+      </div>
     </header>
 
     <section class="toolbar">
@@ -67,8 +70,39 @@
       <h2>最近 episode</h2>
       <div id="table" class="table"><span class="empty small">—</span></div>
     </section>
+
+    <section class="card">
+      <h2>控制台输出 <span class="muted small" id="console-hint">console.log</span></h2>
+      <pre id="console" class="log"><span class="empty small">这个 run 没有 console.log（不是看板启动的）</span></pre>
+    </section>
   </main>
 </div>
+
+<div id="launch" class="modal" hidden>
+  <div class="modal-box">
+    <header class="modal-head">
+      <h2>启动训练</h2>
+      <button id="launch-close" class="icon" title="关闭">✕</button>
+    </header>
+    <p class="muted small modal-note">
+      参数会写进 run 目录的 <code>meta.json</code>，训练日志实时回传到下面的控制台。
+    </p>
+    <div class="form">
+      <label class="form-row">
+        <span>实验</span>
+        <select id="recipe"></select>
+      </label>
+      <p id="recipe-desc" class="muted small recipe-desc"></p>
+      <div id="params" class="params"></div>
+    </div>
+    <pre id="launch-msg" class="log small-log" hidden></pre>
+    <footer class="modal-foot">
+      <span id="launch-state" class="muted small"></span>
+      <button id="launch-go" class="primary">启动</button>
+    </footer>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>

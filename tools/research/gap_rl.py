@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -38,8 +39,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from touhou_rl_mcp.config import Config, runtime_dir   # noqa: E402
 from touhou_rl_mcp.env import TouhouEnv            # noqa: E402
 from touhou_rl_mcp.training.journal import Journal  # noqa: E402
+from touhou_rl_mcp.types import PLAYFIELD_WIDTH    # noqa: E402
 from touhou_rl_mcp.training.occupancy import (     # noqa: E402
-    GapObservation, GapSpec, _bullets, _tta_profile,
+    DIRECTIONS, PLAYER_SPEED, GapObservation, GapSpec,
+    _best_column, _bullets, _column_centers, _tta_profile,
 )
 
 #: 动作表: 8 方向 + 原地, 每个动作承诺 6 帧 (60Hz 下的 0.1 秒)
@@ -49,16 +52,35 @@ ACTIONS: tuple[str, ...] = (
 )
 MACRO_FRAMES = 6
 
-#: 训练场景
-TRAIN_SCENARIO: dict[str, float] = dict(
+#: 训练场景 (v1: 初版缺口墙, 泛化上限 1800 帧已经被打满)
+TRAIN_V1: dict[str, float] = dict(
     interval=130.0, gap_width=60.0, speed=1.8, gap_drift=0.13, gap_phase=0.0,
 )
-#: 泛化测试: 训练时没出现过的相位 / 反向漂移 / 弹速
-HELDOUT_SCENARIOS: tuple[dict[str, float], ...] = (
+HELDOUT_V1: tuple[dict[str, float], ...] = (
     dict(interval=130.0, gap_width=60.0, speed=1.8, gap_drift=-0.17, gap_phase=0.31),
     dict(interval=130.0, gap_width=60.0, speed=1.9, gap_drift=0.29, gap_phase=0.62),
     dict(interval=120.0, gap_width=64.0, speed=1.8, gap_drift=-0.24, gap_phase=0.15),
 )
+
+#: v2: 更窄的缺口 (46px, 扣掉判定半径后只有 36px)、更快的墙、更大的漂移。
+#: 难度按"缺口跟随能活满、站着不动很快死"标定 —— 两者都成立才是一个有区分度的基准。
+TRAIN_V2: dict[str, float] = dict(
+    interval=95.0, gap_width=46.0, speed=2.05, gap_drift=0.34, gap_phase=0.0,
+)
+#: 泛化: 反向漂移 / 更快弹速 / 更短间隔, 全部标定过"缺口跟随能活满 2400 帧"
+HELDOUT_V2: tuple[dict[str, float], ...] = (
+    dict(interval=95.0, gap_width=46.0, speed=2.05, gap_drift=-0.41, gap_phase=0.27),
+    dict(interval=88.0, gap_width=48.0, speed=2.2, gap_drift=0.29, gap_phase=0.58),
+    dict(interval=102.0, gap_width=44.0, speed=1.95, gap_drift=-0.36, gap_phase=0.13),
+)
+
+BENCHMARKS: dict[str, tuple[dict[str, float], tuple[dict[str, float], ...]]] = {
+    "v1": (TRAIN_V1, HELDOUT_V1),
+    "v2": (TRAIN_V2, HELDOUT_V2),
+}
+
+#: 缺口的判定半径 (自机 2 + 弹 3), 用来把"可选列"折成"真正站得住的列"
+REACH_PAD = 6.0
 
 
 # ----------------------------------------------------------------------
@@ -225,7 +247,7 @@ def lane_safety(state, spec: GapSpec) -> float:
     给出密集梯度 —— 没有它, "站着不动"就是一个很难跳出的局部最优。
     """
     pos, vel = _bullets(state)
-    profile = _tta_profile(state.player_x, state.player_y, pos, vel, spec)
+    profile = _tta_profile(state.player_y, pos, vel, spec)
     mid = spec.tta_cols // 2
     return float(profile[mid])
 
@@ -234,7 +256,7 @@ def rollout(env: TouhouEnv, enc: GapObservation, policy: Policy | None,
             rng: np.random.Generator, *, seed: int,
             scenario: dict[str, float], max_frames: int,
             greedy: bool = False, shaping: float = 0.0,
-            epsilon: float = 0.0) -> dict:
+            epsilon: float = 0.0, label_mode: str | None = "future") -> dict:
     state = reset_env(env, seed, scenario)
     obs_list, act_list, rew_list = [], [], []
     prev_action = -1
@@ -263,7 +285,7 @@ def rollout(env: TouhouEnv, enc: GapObservation, policy: Policy | None,
             prev_phi = phi
         obs_list.append(obs)
         act_list.append(action)
-        labels.append(gap_label(state, enc.spec))
+        labels.append(gap_label(state, enc.spec, label_mode) if label_mode else 0)
         rew_list.append(reward)
         prev_action = action
         if result.done:
@@ -298,10 +320,12 @@ def gap_follower(env: TouhouEnv, spec: GapSpec, *, seed: int,
         if pos.shape[0] == 0:
             action = 0
         else:
-            prof = _tta_profile(state.player_x, state.player_y, pos, vel, spec)
-            k = int(np.argmax(prof))
-            target = state.player_x - spec.span_x + (k + 0.5) * 2 * spec.span_x / spec.tta_cols
-            delta = target - state.player_x
+            prof = _tta_profile(state.player_y, pos, vel, spec)
+            # 并列最优时取离自机最近的一列: 否则整片安全时 argmax 恒为最左列,
+            # 基准策略会一路贴左墙, 反而比站着不动死得更早。
+            k = _best_column(prof, state.player_x, spec)
+            centers = _column_centers(spec)
+            delta = centers[k] - state.player_x
             action = 0 if abs(delta) < 8 else (4 if delta > 0 else 3)
         result = env.step(ACTIONS[action], frames=MACRO_FRAMES, auto_reset=False)
         state = result.state
@@ -313,27 +337,48 @@ def gap_follower(env: TouhouEnv, spec: GapSpec, *, seed: int,
 
 def evaluate(env: TouhouEnv, enc: GapObservation, policy: Policy,
              rng: np.random.Generator, *, max_frames: int,
+             heldout: tuple[dict[str, float], ...], label_mode: str = "future",
              seeds: tuple[int, ...] = (101, 202)) -> tuple[float, list[float]]:
     scores = []
-    for scenario in HELDOUT_SCENARIOS:
+    for scenario in heldout:
         for seed in seeds:
             out = rollout(env, enc, policy, rng, seed=seed, scenario=scenario,
-                          max_frames=max_frames, greedy=True)
+                          max_frames=max_frames, greedy=True, label_mode=label_mode)
             scores.append(out["frames"])
     return float(np.mean(scores)), scores
 
 
 def action_profile(env: TouhouEnv, enc: GapObservation, policy: Policy,
-                   rng: np.random.Generator, *, max_frames: int) -> np.ndarray:
+                   rng: np.random.Generator, *, max_frames: int,
+                   heldout: tuple[dict[str, float], ...],
+                   label_mode: str = "future") -> np.ndarray:
     """贪心策略在测试场景下的动作分布 —— 用来识别"学会不动"这种退化。"""
     counts = np.zeros(len(ACTIONS))
-    for scenario in HELDOUT_SCENARIOS:
+    for scenario in heldout:
         out = rollout(env, enc, policy, rng, seed=101, scenario=scenario,
-                      max_frames=max_frames, greedy=True)
+                      max_frames=max_frames, greedy=True, label_mode=label_mode)
         for a in out["act"]:
             counts[a] += 1
     total = counts.sum()
     return counts / total if total else counts
+
+
+def label_agreement(env: TouhouEnv, enc: GapObservation, policy: Policy,
+                    rng: np.random.Generator, *, max_frames: int,
+                    heldout: tuple[dict[str, float], ...],
+                    label_mode: str) -> float:
+    """策略动作与几何标签的一致率 (贪心, 只看未见过的场景)。
+
+    这是比存活帧数更直接的"学会了没有": 存活可能靠苟, 一致率不行 —— 它要求策略在
+    每个状态下都选对方向, 而且是在没见过的相位/漂移/弹速上。
+    """
+    hits = total = 0
+    for scenario in heldout:
+        out = rollout(env, enc, policy, rng, seed=101, scenario=scenario,
+                      max_frames=max_frames, greedy=True, label_mode=label_mode)
+        hits += int(np.sum(out["act"] == out["label"]))
+        total += int(out["act"].shape[0])
+    return hits / total if total else 0.0
 
 
 def spec_for_arm(arm: str) -> GapSpec:
@@ -344,37 +389,141 @@ def spec_for_arm(arm: str) -> GapSpec:
     return GapSpec(use_grid=True, use_geo=True, use_clearance=True)
 
 
-def gap_label(state, spec: GapSpec) -> int:
-    """单步几何标签: 缺口在自机左边 (3) / 右边 (4) / 已在脚下 (0)。
-
-    这是**感知层面的弱监督** —— 只回答"缺口在哪", 不回答"该怎么躲"。它不依赖任何
-    手写代价函数, 也不依赖搜索, 但足以把"看缺口"这件事教给网络; 真正怎么躲仍然由
-    RL 在环境里优化。
-    """
+def _tta_frames(state, spec: GapSpec) -> np.ndarray:
+    """把归一化剖面换算回"每列还有多少帧被占" (帧)。"""
     pos, vel = _bullets(state)
-    if pos.shape[0] == 0:
+    prof = _tta_profile(state.player_y, pos, vel, spec)
+    return prof * float(spec.tta_horizon)
+
+
+def _reach_target(state, spec: GapSpec) -> float | None:
+    """考虑"能不能及时赶到"之后, 值得去的目标列中心 (绝对 x)。
+
+    原来的标签只问"现在哪一列最空", 于是会指着一列 200px 外、但 30 帧后就要被封死
+    的缝。这里改成 ``可用余量 - 赶路时间``: 站得住且来得及的列才值得去, 已经站对了
+    就不动 (距离代价为 0, 天然占优)。
+    """
+    tta = _tta_frames(state, spec)
+    if not np.any(tta > 0):
+        return None
+    centers = _column_centers(spec)
+    travel = np.abs(centers - state.player_x) / PLAYER_SPEED
+    slack = tta - travel                      # 赶到之后还剩多少帧安全余量
+    # 判定半径之内的列差一个像素没有区别, 用 pad 把"站得住"的列并成一档
+    padded = np.floor(slack / REACH_PAD) * REACH_PAD
+    best = float(padded.max())
+    tied = np.flatnonzero(padded >= best - 1e-9)
+    k = int(tied[np.argmin(np.abs(centers[tied] - state.player_x))])
+    return float(centers[k])
+
+
+def _macro_x(x: float, action: int) -> float:
+    """朝某方向承诺 ``MACRO_FRAMES`` 帧后的横坐标 (斜向按 45° 归一化)。"""
+    ux, uy = DIRECTIONS[action]
+    norm = float(np.hypot(ux, uy))
+    dx = (ux / norm) if norm else 0.0
+    return min(PLAYFIELD_WIDTH - 8.0, max(8.0, x + dx * PLAYER_SPEED * MACRO_FRAMES))
+
+
+def gap_label(state, spec: GapSpec, mode: str = "future") -> int:
+    """弱监督标签: 只回答"往哪个方向走", 不回答"该不该躲"。
+
+    三种口径, 依次递进 (都只用几何测量, 不含手写代价函数):
+
+    ``now``
+        当前剖面里最空的那一列。**问题**: 它不管自机来不来得及, 而且整片安全时
+        argmax 会退化成某一个固定列 (已修成"挑离自机最近的列")。
+    ``reach``
+        在 ``now`` 上加入可达性: 目标列必须"赶过去以后还有余量"。已经站对时标签是
+        原地, 不会为了 3 个像素的偏差来回摆。
+    ``future``
+        承诺语义: 沿同一方向推 4 步 (24 帧) 取最好的时刻, 直接输出动作。详见
+        :func:`_future_label`。
+    """
+    if mode == "future":
+        return _future_label(state, spec)
+    target = _reach_target(state, spec)
+    if target is None:
         return 0
-    profile = _tta_profile(state.player_x, state.player_y, pos, vel, spec)
-    k = int(np.argmax(profile))
-    target = state.player_x - spec.span_x + (k + 0.5) * 2 * spec.span_x / spec.tta_cols
     delta = target - state.player_x
+    if abs(delta) < 10.0:
+        return 0
+    if mode == "reach":
+        return 4 if delta > 0 else 3
+    # now: 只取当前最空的一列, 不考虑赶路
+    tta = _tta_frames(state, spec)
+    if not np.any(tta > 0):
+        return 0
+    k = _best_column(tta / float(spec.tta_horizon), state.player_x, spec)
+    delta = float(_column_centers(spec)[k]) - state.player_x
     if abs(delta) < 10.0:
         return 0
     return 4 if delta > 0 else 3
 
 
+def _future_label(state, spec: GapSpec, lookahead: int = 4) -> int:
+    """前瞻标签: 朝某个方向连续走 ``lookahead`` 个宏动作, 取这条直线上最好的时刻。
+
+    ``now`` / ``reach`` 都只看"此刻哪条车道最空", 于是缺口在 100px 外时它给不出
+    "现在就该往那边挪"的信号 —— 而每步只能走 26px, 等到"此刻最空的那条"变成眼前
+    的车道时往往已经来不及。
+
+    这里换成**承诺语义**: 沿同一方向推 4 步 (24 帧, ~105px), 看看这条路上最好的时刻
+    能有多安全。它和策略的动作空间同构, 也不会左右摇摆。
+
+    两个实测过的坑 (都写在这里, 免得再踩):
+    * 只算一步落点 -> 所有方向都不如原地 (还要付 6 帧赶路), 标签退化成"永远别动";
+    * 把纵向位移按弹速折算成"少了几帧余量" -> 下移看起来永远划算, 标签退化成
+      "一直按着下" (71% 的样本)。在只有存活奖励的任务里, 苟活永远是最省事的最优。
+    """
+    tta = _tta_frames(state, spec)
+    if not np.any(tta > 0):
+        return 0
+    cols = spec.tta_cols
+    cell = float(PLAYFIELD_WIDTH) / cols
+
+    def column(x: float) -> int:
+        return int(min(cols - 1, max(0, x / cell)))
+
+    best: tuple[tuple[float, float], int] | None = None
+    for action in range(len(DIRECTIONS)):
+        x = state.player_x
+        score = -1e18
+        for step in range(1, lookahead + 1):
+            x = _macro_x(x, action)
+            score = max(score, float(tta[column(x)]) - step * MACRO_FRAMES)
+        # 量化到 REACH_PAD, 避免"差 1 帧"就换动作的抖动; 并列时位移小的胜出
+        quantised = math.floor(score / REACH_PAD) * REACH_PAD
+        key = (-quantised, abs(_macro_x(state.player_x, action) - state.player_x))
+        if best is None or key < best[0]:
+            best = (key, action)
+    return 0 if best is None else best[1]
+
+
 def collect_labels(env: TouhouEnv, enc: GapObservation, rng: np.random.Generator,
                    *, episodes: int, max_frames: int,
-                   scenario: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
-    """用随机策略走一遍, 收集 (观测, 缺口方向) 对 —— 覆盖各种站位与相位。"""
+                   scenario: dict[str, float],
+                   label_mode: str = "future",
+                   policy: Policy | None = None,
+                   epsilon: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """走一遍并把**每个访问到的状态**用几何规则打上标签。
+
+    ``policy=None`` 时用均匀随机动作 (离线 BC 的数据来源); 传入策略时用它自己的
+    轨迹 (DAgger) —— 这时标签覆盖的是"策略真正会走到的状态", 而不是随机游走的
+    状态分布, 这正是 BC 一步准确率 89% 却在闭环里只有 47% 的根因。
+    """
     xs, ys = [], []
     for _ in range(episodes):
         state = reset_env(env, seed=int(rng.integers(1, 10 ** 6)), scenario=scenario)
         prev, frames = -1, 0
         while frames < max_frames:
-            xs.append(enc(state, prev_action=prev).copy())
-            ys.append(gap_label(state, enc.spec))
-            action = int(rng.integers(len(ACTIONS)))
+            obs = enc(state, prev_action=prev).copy()
+            xs.append(obs)
+            ys.append(gap_label(state, enc.spec, label_mode))
+            if policy is None:
+                action = int(rng.integers(len(ACTIONS)))
+            else:
+                action, _ = policy.act(obs, rng, epsilon=epsilon)
             result = env.step(ACTIONS[action], frames=MACRO_FRAMES, auto_reset=False)
             state, frames, prev = result.state, frames + MACRO_FRAMES, action
             if result.done:
@@ -382,32 +531,80 @@ def collect_labels(env: TouhouEnv, enc: GapObservation, rng: np.random.Generator
     return np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.intp)
 
 
-def pretrain(env: TouhouEnv, enc: GapObservation, policy: Policy,
-             rng: np.random.Generator, *, episodes: int, epochs: int,
-             max_frames: int, scenario: dict[str, float]) -> float:
-    X, Y = collect_labels(env, enc, rng, episodes=episodes, max_frames=max_frames,
-                          scenario=scenario)
+def fit_imitation(policy: Policy, X: np.ndarray, Y: np.ndarray,
+                  rng: np.random.Generator, *, epochs: int, batch: int = 256,
+                  verbose: bool = True) -> dict[str, float]:
+    """在给定 (状态, 标签) 上做交叉熵模仿, 返回训练/留出准确率。"""
+    if X.shape[0] == 0:
+        return {"samples": 0, "train_acc": 0.0, "holdout_acc": 0.0}
     split = int(X.shape[0] * 0.8)
     Xtr, Ytr, Xte, Yte = X[:split], Y[:split], X[split:], Y[split:]
     for _ in range(epochs):
         order = rng.permutation(Xtr.shape[0])
-        for start in range(0, order.shape[0], 256):
-            idx = order[start:start + 256]
+        for start in range(0, order.shape[0], batch):
+            idx = order[start:start + batch]
             policy.imitate(Xtr[idx], Ytr[idx])
-    acc = float(np.mean(np.argmax(policy._forward(Xte)[2], axis=1) == Yte))
+    acc = float(np.mean(np.argmax(policy._forward(Xte)[2], axis=1) == Yte)) if Xte.shape[0] else 0.0
     train_acc = float(np.mean(np.argmax(policy._forward(Xtr)[2], axis=1) == Ytr))
-    print(f"  感知预训练: {X.shape[0]} 样本  训练准确率 {train_acc:.0%}  "
-          f"留出准确率 {acc:.0%}")
-    return acc
+    if verbose:
+        print(f"  模仿学习: {X.shape[0]} 样本  训练准确率 {train_acc:.0%}  "
+              f"留出准确率 {acc:.0%}")
+    return {"samples": int(X.shape[0]), "train_acc": round(train_acc, 4),
+            "holdout_acc": round(acc, 4)}
+
+
+def pretrain(env: TouhouEnv, enc: GapObservation, policy: Policy,
+             rng: np.random.Generator, *, episodes: int, epochs: int,
+             max_frames: int, scenario: dict[str, float],
+             label_mode: str = "future"
+             ) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    """随机策略采样 + 模仿, 返回 (统计, X, Y) —— X/Y 供 DAgger 继续聚合。"""
+    X, Y = collect_labels(env, enc, rng, episodes=episodes, max_frames=max_frames,
+                          scenario=scenario, label_mode=label_mode)
+    stats = fit_imitation(policy, X, Y, rng, epochs=epochs)
+    stats["label"] = label_mode
+    return stats, X, Y
+
+
+def dagger_rounds(env: TouhouEnv, enc: GapObservation, policy: Policy,
+                  rng: np.random.Generator, *, X: np.ndarray, Y: np.ndarray,
+                  rounds: int, episodes: int, epochs: int, max_frames: int,
+                  scenario: dict[str, float], label_mode: str,
+                  epsilon: float, cap: int,
+                  on_round=None) -> tuple[np.ndarray, np.ndarray]:
+    """DAgger: 用**当前策略**跑, 在它自己的状态上重新打标签, 再聚合重训。
+
+    BC 的问题就出在数据集分布上: 随机策略走两步就死, 收集到的大多是"已经没救"的
+    状态; 真正需要学会的是"被自己带偏之后怎么救回来"的状态。DAgger 每轮都在这些
+    状态上补标签, 所以一步准确率不用提高多少, 闭环表现就能上去。
+    """
+    for index in range(1, rounds + 1):
+        Xn, Yn = collect_labels(env, enc, rng, episodes=episodes, max_frames=max_frames,
+                                scenario=scenario, label_mode=label_mode,
+                                policy=policy, epsilon=epsilon)
+        X = np.concatenate([X, Xn])
+        Y = np.concatenate([Y, Yn])
+        if X.shape[0] > cap:                 # 只保留最近 cap 个样本, 控制内存与耗时
+            X, Y = X[-cap:], Y[-cap:]
+        stats = fit_imitation(policy, X, Y, rng, epochs=epochs, verbose=False)
+        if on_round is not None:
+            on_round(index, stats)
+        print(f"  DAgger 第 {index} 轮: 样本 {X.shape[0]}  "
+              f"留出准确率 {stats['holdout_acc']:.0%}")
+    return X, Y
 
 
 # ----------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="缺口任务上的最小 RL 实验")
     ap.add_argument("--arm", choices=("geo", "grid", "both"), default="both")
+    ap.add_argument("--bench", choices=tuple(BENCHMARKS), default="v2",
+                    help="基准版本: v1=初版缺口墙, v2=更窄更快、漂移更大的新基准")
+    ap.add_argument("--label", choices=("now", "reach", "future"), default="reach",
+                    help="弱监督标签口径: now=当前最空; reach=考虑赶路时间; future=两步 maximin")
     ap.add_argument("--updates", type=int, default=60)
     ap.add_argument("--episodes", type=int, default=16, help="每次更新采集多少局")
-    ap.add_argument("--max-frames", type=int, default=1800, help="单局上限帧数")
+    ap.add_argument("--max-frames", type=int, default=2400, help="单局上限帧数")
     ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--lr", type=float, default=4e-3)
     ap.add_argument("--seed", type=int, default=7)
@@ -425,6 +622,14 @@ def main() -> int:
     ap.add_argument("--bc-epochs", type=int, default=6)
     ap.add_argument("--bc-coef", type=float, default=0.0,
                     help="RL 微调时锚定缺口感知的强度 (0=不做约束)")
+    ap.add_argument("--dagger", type=int, default=0,
+                    help="DAgger 轮数: 用策略自己的轨迹补标签 (>0 才启用)")
+    ap.add_argument("--dagger-episodes", type=int, default=0,
+                    help="每轮 DAgger 采多少局 (0=沿用 --bc-episodes)")
+    ap.add_argument("--dagger-epsilon", type=float, default=0.15,
+                    help="DAgger 采样时的 ε-探索, 用来覆盖被带偏后的状态")
+    ap.add_argument("--dagger-cap", type=int, default=40000,
+                    help="聚合数据集上限 (只保留最近 N 个样本)")
     ap.add_argument("--entropy", type=float, default=0.02)
     ap.add_argument("--train-override", default="",
                     help="覆盖训练场景, 逗号分隔 key=value (课程用), 如 gap_width=140,interval=180")
@@ -432,7 +637,8 @@ def main() -> int:
                     help="宽缺口 -> 窄缺口的课程: 前 1/3 用宽缺口, 中 1/3 过渡")
     args = ap.parse_args()
 
-    train_scenario = dict(TRAIN_SCENARIO)
+    train_scenario = dict(BENCHMARKS[args.bench][0])
+    heldout = BENCHMARKS[args.bench][1]
     for part in args.train_override.split(","):
         if "=" in part:
             key, _, value = part.partition("=")
@@ -445,43 +651,124 @@ def main() -> int:
     policy = Policy(enc.dim, len(ACTIONS), seed=args.seed, lr=args.lr,
                     hidden=args.hidden, entropy=args.entropy)
 
-    print(f"arm={args.arm} obs_dim={enc.dim} {enc.describe()}")
+    print(f"bench={args.bench}  label={args.label}  arm={args.arm}  "
+          f"obs_dim={enc.dim} {enc.describe()}")
     print(f"train scenario: {train_scenario}")
 
+    def _bench_line(tag: str, scenarios: tuple[dict[str, float], ...]) -> None:
+        noop = [rollout(env, enc, None, rng, seed=101 + i, scenario=sc,
+                        max_frames=args.max_frames, label_mode=None)["frames"]
+                for sc in scenarios for i in range(1)]
+        follow = [gap_follower(env, spec, seed=101 + i, scenario=sc,
+                               max_frames=args.max_frames)["frames"]
+                  for sc in scenarios for i in range(1)]
+        print(f"  {tag} noop 基准: {np.mean(noop):7.0f} 帧   {[int(x) for x in noop]}")
+        print(f"  {tag} 缺口跟随: {np.mean(follow):7.0f} 帧   {[int(x) for x in follow]}")
+
     if args.baseline:
-        noop = [rollout(env, enc, None, rng, seed=101 + i, scenario=train_scenario,
-                        max_frames=args.max_frames)["frames"] for i in range(3)]
-        follow = [gap_follower(env, spec, seed=101 + i, scenario=train_scenario,
-                               max_frames=args.max_frames)["frames"] for i in range(3)]
-        print(f"  noop 基准: {np.mean(noop):7.0f} 帧   {noop}")
-        print(f"  缺口跟随: {np.mean(follow):7.0f} 帧   {follow}")
+        _bench_line("训练场景", (train_scenario,))
+        _bench_line("泛化场景", heldout)
 
-    if args.bc_episodes > 0:
-        pretrain(env, enc, policy, rng, episodes=args.bc_episodes,
-                 epochs=args.bc_epochs, max_frames=args.max_frames,
-                 scenario=train_scenario)
-        score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames)
-        print(f"  仅感知预训练 (无 RL): 泛化 {score:.0f} 帧  {[int(x) for x in detail]}")
-        dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames)
-        print("  动作分布: " + "  ".join(
-            f"{ACTIONS[i].replace('+shoot', '') or 'stay'}={dist[i]:.0%}"
-            for i in np.argsort(-dist) if dist[i] > 0.02))
-
-    journal = None
     run_dir = None
+    journal = None
     if not args.no_journal:
         run_dir = Path(args.run_dir) if args.run_dir else (
-            runtime_dir() / "runs" / f"{args.arm}-{time.strftime('%Y%m%d-%H%M%S')}")
+            runtime_dir() / "runs" / f"{args.bench}-{args.label}-{args.arm}-"
+                                     f"{time.strftime('%Y%m%d-%H%M%S')}")
         journal = Journal(run_dir)
-        (run_dir / "meta.json").write_text(json.dumps({
-            "script": "tools/research/gap_rl.py",
-            "arm": args.arm,
-            "obs": enc.describe(),
-            "train_scenario": train_scenario,
-            "heldout": HELDOUT_SCENARIOS,
-            "args": vars(args),
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_dir.mkdir(parents=True, exist_ok=True)
         print(f"训练记录: {run_dir}")
+
+    meta: dict[str, object] = {
+        "script": "tools/research/gap_rl.py",
+        "bench": args.bench,
+        "label": args.label,
+        "arm": args.arm,
+        "obs": enc.describe(),
+        "train_scenario": train_scenario,
+        "heldout": list(heldout),
+        "args": vars(args),
+    }
+
+    def _write_meta() -> None:
+        if run_dir is not None:
+            (run_dir / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8")
+
+    def _eval_row(step: int, name: str, score: float, detail: list[int],
+                  **extra: object) -> None:
+        if run_dir is None:
+            return
+        row = {"step": step, "name": name, "score": round(score, 1),
+               "detail": [int(x) for x in detail]}
+        row.update(extra)
+        with open(run_dir / "eval.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    super_X = super_Y = None
+    if args.bc_episodes > 0:
+        stats, super_X, super_Y = pretrain(
+            env, enc, policy, rng, episodes=args.bc_episodes,
+            epochs=args.bc_epochs, max_frames=args.max_frames,
+            scenario=train_scenario, label_mode=args.label)
+        meta["pretrain"] = stats
+        score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames,
+                                 heldout=heldout, label_mode=args.label)
+        agree = label_agreement(env, enc, policy, rng, max_frames=args.max_frames,
+                                heldout=heldout, label_mode=args.label)
+        print(f"  仅感知预训练 (无 RL): 泛化 {score:.0f} 帧  "
+              f"一致率 {agree:.0%}  {[int(x) for x in detail]}")
+        _eval_row(0, "pretrain", score, detail, acc=stats["holdout_acc"],
+                  agree=round(agree, 4))
+        # 纯模仿学习没有 RL 更新, 但看板需要一条曲线 —— 每一轮就是一条"episode"
+        if journal is not None:
+            journal.episode({"episode": 0, "return": round(score, 2),
+                             "agree": round(agree, 4),
+                             "acc": stats["holdout_acc"], "steps": stats["samples"]})
+        dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames,
+                              heldout=heldout, label_mode=args.label)
+        print("  动作分布: " + _dist_text(dist))
+
+    if args.dagger > 0 and super_X is not None:
+        def _on_round(index: int, st: dict[str, float]) -> None:
+            score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames,
+                                     heldout=heldout, label_mode=args.label)
+            agree = label_agreement(env, enc, policy, rng, max_frames=args.max_frames,
+                                    heldout=heldout, label_mode=args.label)
+            print(f"    泛化 {score:.0f} 帧  一致率 {agree:.0%}  {[int(x) for x in detail]}")
+            _eval_row(index, f"dagger{index}", score, detail,
+                      acc=st.get("holdout_acc"), agree=round(agree, 4))
+            if journal is not None:
+                dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames,
+                                      heldout=heldout, label_mode=args.label)
+                journal.episode({
+                    "episode": index, "return": round(score, 2),
+                    "agree": round(agree, 4), "acc": st.get("holdout_acc"),
+                    "steps": int(st.get("samples", 0)),
+                    "actions": {ACTIONS[i]: int(round(float(p) * 1000))
+                                for i, p in enumerate(dist) if p > 0.01},
+                })
+
+        super_X, super_Y = dagger_rounds(
+            env, enc, policy, rng, X=super_X, Y=super_Y, rounds=args.dagger,
+            episodes=args.dagger_episodes or args.bc_episodes, epochs=args.bc_epochs,
+            max_frames=args.max_frames, scenario=train_scenario, label_mode=args.label,
+            epsilon=args.dagger_epsilon, cap=args.dagger_cap, on_round=_on_round)
+        score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames,
+                                 heldout=heldout, label_mode=args.label)
+        agree = label_agreement(env, enc, policy, rng, max_frames=args.max_frames,
+                                heldout=heldout, label_mode=args.label)
+        meta["dagger"] = {"rounds": args.dagger, "score": round(score, 1),
+                          "agree": round(agree, 4),
+                          "detail": [int(x) for x in detail]}
+        dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames,
+                              heldout=heldout, label_mode=args.label)
+        print(f"  DAgger 之后: 泛化 {score:.0f} 帧  一致率 {agree:.0%}  "
+              f"{[int(x) for x in detail]}")
+        print("  动作分布: " + _dist_text(dist))
+
+    _write_meta()
 
     best = 0.0
     t0 = time.time()
@@ -499,6 +786,7 @@ def main() -> int:
             out = rollout(env, enc, policy, rng, seed=int(rng.integers(1, 10 ** 6)),
                           scenario=scenario, max_frames=args.max_frames,
                           shaping=args.shaping,
+                          label_mode=args.label if args.bc_coef > 0 else None,
                           epsilon=(max(0.05, args.epsilon * (1.0 - it / args.updates))
                                    if args.epsilon > 0 else 0.0))
             if out["obs"].shape[0] == 0:
@@ -528,26 +816,35 @@ def main() -> int:
         msg = (f"[{it:3d}/{args.updates}] 训练存活 {mean_frames:6.0f} 帧 "
                f"loss={loss:+.3f}  {time.time() - t0:5.1f}s")
         if it % args.eval_every == 0 or it == args.updates:
-            score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames)
+            score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames,
+                                     heldout=heldout, label_mode=args.label)
+            agree = label_agreement(env, enc, policy, rng, max_frames=args.max_frames,
+                                    heldout=heldout, label_mode=args.label)
             best = max(best, score)
-            if run_dir is not None:
-                with open(run_dir / "eval.jsonl", "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"step": it, "name": "heldout",
-                                         "score": round(score, 1),
-                                         "detail": [int(x) for x in detail]},
-                                        ensure_ascii=False) + "\n")
-            msg += f" | 泛化 {score:6.0f} 帧 {[int(x) for x in detail]}"
+            _eval_row(it, "heldout", score, detail, agree=round(agree, 4))
+            msg += f" | 泛化 {score:6.0f} 帧 一致率 {agree:4.0%} {[int(x) for x in detail]}"
         print(msg, flush=True)
 
-    score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames)
-    dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames)
-    print(f"\n最终泛化 (未见过的相位/反向漂移/弹速): {score:.0f} 帧  {[int(x) for x in detail]}")
+    score, detail = evaluate(env, enc, policy, rng, max_frames=args.max_frames,
+                             heldout=heldout, label_mode=args.label)
+    agree = label_agreement(env, enc, policy, rng, max_frames=args.max_frames,
+                            heldout=heldout, label_mode=args.label)
+    dist = action_profile(env, enc, policy, rng, max_frames=args.max_frames,
+                          heldout=heldout, label_mode=args.label)
+    meta["final"] = {"score": round(score, 1), "agree": round(agree, 4),
+                     "detail": [int(x) for x in detail], "best": round(best, 1)}
+    _write_meta()
+    print(f"\n最终泛化 (未见过的相位/反向漂移/弹速): {score:.0f} 帧  "
+          f"标签一致率 {agree:.0%}  {[int(x) for x in detail]}")
     print(f"最好一次泛化: {best:.0f} 帧")
-    print("动作分布: " + "  ".join(
-        f"{ACTIONS[i].replace('+shoot', '') or 'stay'}={dist[i]:.0%}"
-        for i in np.argsort(-dist) if dist[i] > 0.02))
+    print("动作分布: " + _dist_text(dist))
     env.close()
     return 0
+
+
+def _dist_text(dist: np.ndarray) -> str:
+    return "  ".join(f"{ACTIONS[i].replace('+shoot', '') or 'stay'}={dist[i]:.0%}"
+                    for i in np.argsort(-dist) if dist[i] > 0.02)
 
 
 if __name__ == "__main__":

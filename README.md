@@ -58,8 +58,9 @@ C:\Python313\python.exe -m venv .venv
 ```
 
 训练看板是一个本地网页（标准库实现，无新依赖、不联网），扫描 `.runtime` 下所有含
-`train.jsonl` 的目录：曲线、动作直方图、评估记录、实时增量刷新。用法与扩展方式见
-[DASHBOARD.md](docs/DASHBOARD.md)。
+`train.jsonl` 的目录：曲线、动作直方图、评估记录、实时增量刷新。页面右上角的
+**「启动训练」**可以直接按白名单食谱起一次实验（参数表单 → 子进程 → 控制台实时回显），
+不用再切终端。用法与扩展方式见 [DASHBOARD.md](docs/DASHBOARD.md)。
 
 ## 2. 接入 OpenCode / Agent 平台
 
@@ -336,7 +337,7 @@ E:\TouHou-Ai\
 ├── tools\                           # 活跃 CLI (索引见 tools\README.md)
 │   ├── research\                    # 可复现实验 (gap_rl / gap_benchmark)
 │   └── legacy\                      # 已归档的一次性脚本 (见其 README)
-├── tests\                           # 123 个用例 (MCP 会话 / 训练 / 标定 / 看板 / 观测)
+├── tests\                           # 133 个用例 (MCP 会话 / 训练 / 标定 / 看板 / 观测)
 ├── docs\
 │   ├── STATUS.md                    # 项目现状 + 路线图 (唯一现状来源)
 │   ├── OFFSET_CALIBRATION.md        # 内存偏移标定手册

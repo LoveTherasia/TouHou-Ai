@@ -24,6 +24,8 @@ RUN_MARKER = "train.jsonl"
 META_FILE = "meta.json"
 #: 可选的结构化评估结果, 每行 ``{"step": int, "name": str, "score": float, ...}``
 EVAL_FILE = "eval.jsonl"
+#: 看板启动的训练会先写它 —— 第一条 episode 还没落盘时也该出现在列表里
+LAUNCH_FILE = "launch.json"
 
 #: 扫描时跳过的目录名
 _SKIP = {"__pycache__", "node_modules", ".git", "legacy", "archive"}
@@ -68,7 +70,7 @@ def _iter_run_dirs(root: Path, max_depth: int) -> Iterable[Path]:
         if depth >= max_depth:
             dirnames[:] = []
         dirnames[:] = [d for d in dirnames if d not in _SKIP and not d.startswith(".")]
-        if RUN_MARKER in filenames:
+        if RUN_MARKER in filenames or LAUNCH_FILE in filenames:
             yield current
 
 
@@ -108,8 +110,10 @@ def discover_runs(roots: list[str | Path], *, max_depth: int = 3) -> list[RunInf
                 continue
             seen.add(key)
             train_path = run_dir / RUN_MARKER
+            # 刚启动的训练只有 launch.json / console.log, 用它兜底取时间戳
+            stamp_path = train_path if train_path.is_file() else run_dir / LAUNCH_FILE
             try:
-                stat = train_path.stat()
+                stat = stamp_path.stat()
             except OSError:
                 continue
             try:

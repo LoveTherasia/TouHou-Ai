@@ -2,17 +2,23 @@
 
 接口
 ----
-GET /                     单页应用
-GET /static/<file>        前端资源
-GET /api/runs             所有 run 的列表 (按修改时间倒序)
-GET /api/run?id=&since=   单个 run: 元数据 + 增量 episode + 指标名 + 动作直方图
-GET /api/asset?id=&name=  读取 run 目录下的产物 (png / json / txt)
-GET /api/health           存活探测
+GET  /                     单页应用
+GET  /static/<file>        前端资源
+GET  /api/runs             所有 run 的列表 (按修改时间倒序)
+GET  /api/run?id=&since=   单个 run: 元数据 + 增量 episode + 指标名 + 动作直方图
+GET  /api/asset?id=&name=  读取 run 目录下的产物 (png / json / txt)
+GET  /api/recipes          可启动的实验清单 (白名单 + 参数表)
+GET  /api/log?id=&lines=   训练进程的 console.log 尾巴
+POST /api/launch           启动一个实验 {recipe, params}
+POST /api/stop             停止本进程启动的训练 {id}
+GET  /api/health           存活探测
 
 设计要点
 --------
 * ``since`` 让前端只取新增的 episode, 训练进行中也能每 2 秒刷新而不重传历史。
 * 所有路径都校验在 run 目录内, 只放行白名单后缀, 避免被当成任意文件读取器。
+* 写操作只接受白名单食谱 (见 :mod:`recipes`), 并要求自定义请求头 —— 浏览器里的
+  普通表单/跨站请求带不上它, 避免被别的网页当成本地面板使唤。
 """
 
 from __future__ import annotations
@@ -26,20 +32,29 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import recipes as recipes_mod
+from .launcher import LaunchManager
 from .registry import discover_runs, load_run
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ASSET_SUFFIXES = {".png", ".jpg", ".json", ".txt", ".jsonl", ".csv", ".gif"}
+#: 写操作必须带上的头 (前端 fetch 会带; 跨站表单带不上)
+WRITE_HEADER = "X-Dashboard"
+#: 请求体上限, 防止被灌大 JSON
+MAX_BODY = 64 * 1024
 
 
 class DashboardState:
     """持有扫描根目录, 按需刷新 run 索引。"""
 
-    def __init__(self, roots: list[str], *, max_depth: int = 3) -> None:
+    def __init__(self, roots: list[str], *, max_depth: int = 3,
+                 launcher: LaunchManager | None = None) -> None:
         self.roots = roots
         self.max_depth = max_depth
         self._runs: dict[str, Any] = {}
         self._stamp = 0.0
+        self.launcher = launcher if launcher is not None else LaunchManager(
+            [Path(r) for r in roots])
 
     def refresh(self) -> dict[str, Any]:
         runs = discover_runs(self.roots, max_depth=self.max_depth)
@@ -105,11 +120,46 @@ def make_handler(state: DashboardState, *, verbose: bool = False):
                     return self._api_run(query)
                 if path == "/api/asset":
                     return self._api_asset(query)
+                if path == "/api/recipes":
+                    return self._json({"recipes": [r.spec() for r in
+                                                   recipes_mod.RECIPES.values()]})
+                if path == "/api/log":
+                    return self._api_log(query)
                 return self._error(404, "not found")
             except BrokenPipeError:      # 浏览器提前断开 (轮询时常见)
                 return
             except Exception as exc:     # 兜底: 单次请求失败不该拖垮服务
                 return self._error(500, f"{type(exc).__name__}: {exc}")
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if self.headers.get(WRITE_HEADER) != "1":
+                return self._error(403, "missing dashboard header")
+            try:
+                body = self._read_body()
+            except ValueError as exc:
+                return self._error(413, str(exc))
+            try:
+                if parsed.path == "/api/launch":
+                    return self._api_launch(body)
+                if parsed.path == "/api/stop":
+                    return self._api_stop(body)
+                return self._error(404, "not found")
+            except ValueError as exc:
+                return self._error(400, str(exc))
+            except Exception as exc:
+                return self._error(500, f"{type(exc).__name__}: {exc}")
+
+        def _read_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY:
+                raise ValueError(f"请求体过大 (> {MAX_BODY} 字节)")
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"JSON 解析失败: {exc}") from exc
+            return data if isinstance(data, dict) else {}
 
         # -- 具体接口 ----------------------------------------------------
         def _serve_static(self, relative: str) -> None:
@@ -120,7 +170,14 @@ def make_handler(state: DashboardState, *, verbose: bool = False):
 
         def _api_runs(self) -> None:
             runs = state.refresh()
-            payload = [run.to_dict() for run in runs.values()]
+            payload = []
+            for run in runs.values():
+                item = run.to_dict()
+                launch = state.launcher.status(run.path)
+                if launch is not None:
+                    item["launch"] = {key: launch.get(key) for key in
+                                      ("state", "pid", "elapsed", "started", "exit_code")}
+                payload.append(item)
             payload.sort(key=lambda r: r["mtime"], reverse=True)
             self._json({"runs": payload})
 
@@ -136,7 +193,37 @@ def make_handler(state: DashboardState, *, verbose: bool = False):
             payload = load_run(run.path, since=max(0, since))
             payload["run"] = run.to_dict()
             payload["since"] = max(0, since)
+            launch = state.launcher.status(run.path)
+            if launch is not None:
+                payload["info"]["launch"] = launch
             self._json(payload)
+
+        def _api_log(self, query: dict[str, list[str]]) -> None:
+            run_id = (query.get("id") or [""])[0]
+            lines = int((query.get("lines") or ["200"])[0] or 200)
+            run_dir = state.launcher.resolve_run_dir(run_id)
+            if run_dir is None:
+                return self._error(404, f"unknown run: {run_id}")
+            text = state.launcher.log(run_dir, lines=min(5000, max(1, lines)))
+            launch = state.launcher.status(run_dir)
+            self._json({"text": text, "launch": launch})
+
+        def _api_launch(self, body: dict[str, Any]) -> None:
+            recipe = str(body.get("recipe") or "")
+            params = body.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("params 必须是对象")
+            result = state.launcher.start(recipe, params)
+            state.refresh()
+            self._json(result)
+
+        def _api_stop(self, body: dict[str, Any]) -> None:
+            run_id = str(body.get("id") or "")
+            run_dir = state.launcher.resolve_run_dir(run_id)
+            if run_dir is None:
+                return self._error(404, f"unknown run: {run_id}")
+            stopped = state.launcher.stop(run_dir)
+            self._json({"stopped": stopped, "id": run_id})
 
         def _api_asset(self, query: dict[str, list[str]]) -> None:
             run_id = (query.get("id") or [""])[0]
@@ -172,6 +259,7 @@ def serve(roots: list[str], *, host: str = "127.0.0.1", port: int = 8770,
     print(f"训练看板: {url}")
     print(f"扫描根目录: {', '.join(str(Path(r).resolve()) for r in roots)}")
     print(f"发现 {len(runs)} 个 run")
+    print(f"可启动实验: {', '.join(recipes_mod.RECIPES)}")
     if open_browser:
         webbrowser.open(url)
     try:

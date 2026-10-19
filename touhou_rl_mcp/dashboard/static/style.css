@@ -130,8 +130,15 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 .run .r-name {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 8px;
   font-weight: 600;
+}
+.run .r-name > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .run .r-meta {
   margin-top: 3px;
@@ -142,6 +149,8 @@ button:hover { border-color: var(--accent); color: var(--accent); }
   flex-wrap: wrap;
 }
 .pill {
+  flex: 0 0 auto;
+  white-space: nowrap;
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 999px;
@@ -302,3 +311,101 @@ tbody tr:hover { background: var(--panel-2); }
 
 .ok { color: var(--ok); }
 .warn { color: var(--warn); }
+
+/* ---------------- 启动入口 ---------------- */
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.primary:hover { color: #fff; filter: brightness(1.08); }
+button.primary:disabled { opacity: .55; cursor: default; filter: none; }
+button.icon { padding: 2px 8px; background: transparent; border-color: transparent; }
+
+.head-side { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill.running { color: var(--accent); border-color: var(--accent); }
+.pill.failed { color: #e11d48; border-color: #e11d48; }
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 14, 20, .45);
+  backdrop-filter: blur(2px);
+}
+.modal[hidden] { display: none; }
+.modal-box {
+  width: min(560px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .32);
+  padding: 16px 18px 14px;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.modal-head h2 { margin: 0; font-size: 15px; }
+.modal-note { margin: 6px 0 12px; }
+.modal-note code {
+  background: var(--panel-2);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.form { display: flex; flex-direction: column; gap: 10px; }
+.form-row {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+.form-row > span { color: var(--muted); font-size: 12px; }
+.form-row select,
+.form-row input[type="number"] {
+  width: 100%;
+  padding: 6px 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.form-row select:focus,
+.form-row input:focus { border-color: var(--accent); }
+.form-row.chk { grid-template-columns: 116px minmax(0, 1fr); }
+.form-row .hint { grid-column: 2; font-size: 11px; color: var(--muted); margin-top: -4px; }
+.recipe-desc { margin: 0; }
+.params { display: flex; flex-direction: column; gap: 8px; }
+.modal-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.log {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: 12px/1.45 "Cascadia Mono", Consolas, "Courier New", monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+}
+.small-log { max-height: 150px; margin-top: 10px; }

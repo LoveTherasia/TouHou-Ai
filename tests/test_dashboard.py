@@ -1,9 +1,11 @@
 """训练看板 (dashboard) 的契约测试。
 
-固定三件事:
-  1. run 的发现规则 —— 只有含 ``train.jsonl`` 的目录才算;
+固定四件事:
+  1. run 的发现规则 —— 含 ``train.jsonl`` 的目录算, 刚启动还没写第一条记录的
+     (只有 ``launch.json``) 也算;
   2. 指标自动发现 —— 数值字段会被扫出来, 但动作直方图不进曲线;
-  3. HTTP 接口可用且**不能**读 run 目录以外的文件。
+  3. HTTP 接口可用且**不能**读 run 目录以外的文件;
+  4. 启动入口只接受白名单食谱 —— 参数越界/未知实验一律拒绝, 写操作必须带自定义头。
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from touhou_rl_mcp.dashboard import recipes as recipes_mod
+from touhou_rl_mcp.dashboard.launcher import LaunchManager
 from touhou_rl_mcp.dashboard.registry import (
     discover_runs, load_run, numeric_metrics, read_episodes,
 )
@@ -165,6 +169,107 @@ class HttpTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/api/run?id=nope")
         self.assertEqual(ctx.exception.code, 404)
+
+
+class LaunchRuleTest(unittest.TestCase):
+    """启动入口: 白名单 + 参数校验 (不真的起进程)。"""
+
+    def test_argv_is_built_from_schema(self) -> None:
+        recipe = recipes_mod.get("gap_bc")
+        argv = recipe.argv({"bench": "v2", "label": "now", "bc_episodes": 12},
+                           run_dir=Path("X"))
+        self.assertIn("--bench", argv)
+        self.assertEqual(argv[argv.index("--bench") + 1], "v2")
+        self.assertEqual(argv[argv.index("--bc-episodes") + 1], "12")
+        self.assertEqual(argv[-2:], ["--run-dir", "X"])
+
+    def test_invalid_params_rejected(self) -> None:
+        recipe = recipes_mod.get("gap_bc")
+        for bad in ({"arm": "nope"}, {"updates": 999}, {"bc_episodes": "abc"},
+                    {"not_a_param": 1}):
+            with self.assertRaises(ValueError):
+                recipe.argv(bad, run_dir=Path("X"))
+        with self.assertRaises(ValueError):
+            recipes_mod.get("no_such_recipe")
+
+    def test_run_dir_encodes_key_params(self) -> None:
+        recipe = recipes_mod.get("gap_bc")
+        path = recipes_mod.default_run_dir(Path("root"), recipe, stamp="20260101-000000",
+                                           params={"bench": "v2", "label": "reach"})
+        self.assertIn("v2", path.name)
+        self.assertIn("reach", path.name)
+
+    def test_dry_run_does_not_spawn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            mgr = LaunchManager([Path(tmp)], dry_run=True)
+            res = mgr.start("gap_bc", {"bc_episodes": 1, "updates": 0})
+            self.assertTrue(res["dry_run"])
+            self.assertIn("gap_bc", res["run_id"])
+            self.assertIsNone(res["launch"]["pid"])
+
+
+class LaunchHttpTest(unittest.TestCase):
+    """启动入口的 HTTP 契约 (dry-run, 只验证校验与鉴权)。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = TemporaryDirectory()
+        cls.root = Path(cls.tmp.name)
+        run_dir = _write_run(cls.root, "alpha", EPISODES)
+        (run_dir / "console.log").write_text("hello\nworld\n", encoding="utf-8")
+        launcher = LaunchManager([cls.root], dry_run=True)
+        cls.state = DashboardState([str(cls.root)], launcher=launcher)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cls.state))
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.tmp.cleanup()
+
+    def _post(self, path: str, body: dict, *, header: bool = True):
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
+                                     method="POST",
+                                     headers={"Content-Type": "application/json"})
+        if header:
+            req.add_header("X-Dashboard", "1")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+
+    def test_recipes_listed(self) -> None:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/recipes",
+                                    timeout=5) as resp:
+            data = json.loads(resp.read())
+        ids = {r["id"] for r in data["recipes"]}
+        self.assertIn("gap_bc", ids)
+        self.assertTrue(all("params" in r for r in data["recipes"]))
+
+    def test_launch_requires_header(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/api/launch", {"recipe": "gap_bc"}, header=False)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_launch_rejects_bad_params(self) -> None:
+        for body in ({"recipe": "nope"}, {"recipe": "gap_bc", "params": {"arm": "x"}}):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/launch", body)
+            self.assertEqual(ctx.exception.code, 400)
+
+    def test_launch_dry_run_returns_run_id(self) -> None:
+        status, data = self._post("/api/launch",
+                                  {"recipe": "gap_bc", "params": {"bc_episodes": 1}})
+        self.assertEqual(status, 200)
+        self.assertIn("runs/", data["run_id"])
+        self.assertTrue(data["dry_run"])
+
+    def test_log_tail(self) -> None:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/log?id=alpha&lines=1", timeout=5) as resp:
+            data = json.loads(resp.read())
+        self.assertEqual(data["text"], "world")
 
 
 if __name__ == "__main__":

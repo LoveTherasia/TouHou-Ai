@@ -12,7 +12,7 @@ import unittest
 import numpy as np
 
 from touhou_rl_mcp.training.occupancy import (
-    GapObservation, GapSpec, _bullets, _tta_profile,
+    GapObservation, GapSpec, _bullets, _column_centers, _tta_profile,
 )
 from touhou_rl_mcp.types import GameState
 
@@ -50,13 +50,20 @@ class GapSpecTest(unittest.TestCase):
 class TtaProfileTest(unittest.TestCase):
     spec = GapSpec()
 
+    def test_lanes_cover_the_whole_playfield(self) -> None:
+        # 横向必须覆盖整个场地: 一堵全屏宽的弹墙, 缺口可能在任何一侧
+        centers = _column_centers(self.spec)
+        self.assertLess(centers[0], 12.0)
+        self.assertGreater(centers[-1], 372.0)
+
     def test_gap_is_the_safest_column(self) -> None:
         px, py = 192.0, 416.0
         state = _wall_state(px, py, hole_x=px + 64.0, hole_width=60.0, wall_y=py - 200.0)
         pos, vel = _bullets(state)
-        profile = _tta_profile(px, py, pos, vel, self.spec)
+        profile = _tta_profile(py, pos, vel, self.spec)
         col = int(np.argmax(profile))
-        expected_x = px - self.spec.span_x + (col + 0.5) * 2 * self.spec.span_x / self.spec.tta_cols
+        # 车道是**场地绝对**坐标 (覆盖整个 384px), 与自机位置无关
+        expected_x = (col + 0.5) * 384.0 / self.spec.tta_cols
         # 识别到的缺口必须落在真实缺口内 (允许一个格子的量化误差)
         self.assertLessEqual(abs(expected_x - (px + 64.0)), 30.0 + 1e-6)
 
@@ -64,7 +71,7 @@ class TtaProfileTest(unittest.TestCase):
         px, py = 192.0, 416.0
         state = _wall_state(px, py, hole_x=px + 64.0, hole_width=60.0, wall_y=py - 200.0)
         pos, vel = _bullets(state)
-        profile = _tta_profile(px, py, pos, vel, self.spec)
+        profile = _tta_profile(py, pos, vel, self.spec)
         # 场地外的列 (自机被夹在 [8, 376]) 必须判为危险, 否则策略会学成贴边
         self.assertEqual(float(profile[0]), 0.0)
         self.assertEqual(float(profile[-1]), 0.0)
@@ -75,14 +82,14 @@ class TtaProfileTest(unittest.TestCase):
                                        wall_y=py - 200.0, vy=0.5))
         fast, _ = _bullets(_wall_state(px, py, hole_x=px + 64.0, hole_width=60.0,
                                        wall_y=py - 200.0, vy=2.5))
-        prof = _tta_profile(px, py, slow, np.zeros_like(slow), self.spec)
+        prof = _tta_profile(py, slow, np.zeros_like(slow), self.spec)
         prof_slow = prof.copy()
-        prof_fast = _tta_profile(px, py, fast, np.full_like(fast, 2.5), self.spec)
+        prof_fast = _tta_profile(py, fast, np.full_like(fast, 2.5), self.spec)
         # 快弹更早到达 -> 同一列的安全值更低
         self.assertLess(float(prof_fast.mean()), float(prof_slow.mean()))
 
     def test_no_bullets_is_all_clear(self) -> None:
-        profile = _tta_profile(192.0, 416.0, np.zeros((0, 2)), np.zeros((0, 2)), self.spec)
+        profile = _tta_profile(416.0, np.zeros((0, 2)), np.zeros((0, 2)), self.spec)
         reachable = slice(1, self.spec.tta_cols - 1)
         self.assertTrue(np.all(profile[reachable] == 1.0))
 

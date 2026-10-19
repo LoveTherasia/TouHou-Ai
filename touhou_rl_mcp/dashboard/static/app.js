@@ -31,6 +31,11 @@
     layout: null,
     filter: '',
     showAll: false,
+    recipes: [],
+    recipeId: null,
+    paramCache: {},
+    launch: null,
+    consoleTimer: null,
   };
 
   /* ------------------------------------------------------------------ */
@@ -47,6 +52,22 @@
 
   async function api(path) {
     const resp = await fetch(path, { cache: 'no-store' });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { msg = (await resp.json()).error || msg; } catch (_) { /* ignore */ }
+      throw new Error(msg);
+    }
+    return resp.json();
+  }
+
+  // 写操作要带自定义头: 后端据此拒绝跨站表单 (普通 <form> 设不了这个头)
+  async function postApi(path, body) {
+    const resp = await fetch(path, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-Dashboard': '1' },
+      body: JSON.stringify(body || {}),
+    });
     if (!resp.ok) {
       let msg = resp.statusText;
       try { msg = (await resp.json()).error || msg; } catch (_) { /* ignore */ }
@@ -115,8 +136,12 @@
     for (const run of list) {
       const el = document.createElement('div');
       el.className = 'run' + (run.id === state.runId ? ' active' : '');
-      const live = run.age_s < 120 ? '<span class="pill live">live</span>' : '';
-      const episodes = run.episodes ? `${run.episodes} 局` : '0 局';
+      const running = run.launch && run.launch.state === 'running';
+      const failed = run.launch && run.launch.state === 'failed';
+      const live = running ? '<span class="pill running">运行中</span>'
+        : failed ? '<span class="pill failed">失败</span>'
+          : (run.age_s < 120 ? '<span class="pill live">live</span>' : '');
+      const episodes = run.episodes ? `${run.episodes} 局` : (running ? '启动中' : '0 局');
       el.innerHTML = `
         <div class="r-name"><span>${escapeHtml(run.name)}</span>${live}</div>
         <div class="r-meta">
@@ -140,6 +165,7 @@
   /* ------------------------------------------------------------------ */
   async function openRun(id) {
     stopLive();
+    stopConsole();
     state.runId = id;
     syncUrl(id);
     state.episodes = [];
@@ -148,6 +174,7 @@
     state.actions = {};
     state.evalRows = [];
     state.hoverX = null;
+    state.launch = null;
     renderRuns();
     $('run-name').textContent = '载入中…';
 
@@ -155,8 +182,11 @@
       const data = await api(`/api/run?id=${encodeURIComponent(id)}&since=0`);
       applyPayload(data, { replace: true });
       const info = data.run || {};
+      state.launch = (data.info && data.info.launch) || null;
+      state.meta = (data.info && data.info.meta) || {};
       $('run-name').textContent = info.name || id;
       $('run-path').textContent = info.path || '';
+      renderChips(data.info || {});
       setStatus(`已载入 ${state.episodes.length} 局`);
     } catch (err) {
       $('run-name').textContent = '载入失败';
@@ -164,7 +194,90 @@
       setStatus('载入失败');
       return;
     }
+    startConsole();
     if (state.live) startLive();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 配置 chips + 控制台                                                 */
+  /* ------------------------------------------------------------------ */
+  function renderChips(info) {
+    const box = $('chips');
+    const meta = info.meta || {};
+    const args = meta.args || {};
+    const parts = [];
+    const base = (p) => String(p).split(/[\\/]/).pop();
+    if (meta.script) parts.push(base(meta.script));
+    if (meta.arm) parts.push(`观测 ${meta.arm}`);
+    if (meta.bench) parts.push(`基准 ${meta.bench}`);
+    if (meta.label) parts.push(`标签 ${meta.label}`);
+    if (Number.isFinite(Number(args.updates)) && Number(args.updates) > 0) {
+      parts.push(`${args.updates} 次更新`);
+    }
+    if (Number.isFinite(Number(args.bc_coef)) && Number(args.bc_coef) > 0) {
+      parts.push(`BC 锚 ${args.bc_coef}`);
+    }
+    const launch = info.launch;
+    let stateText = '';
+    if (launch) {
+      const elapsed = Number.isFinite(Number(launch.elapsed)) ? `${Math.round(launch.elapsed)}s` : '';
+      if (launch.state === 'running') stateText = `<span class="pill running">运行中 ${elapsed}</span>`;
+      else if (launch.state === 'failed') stateText = `<span class="pill failed">失败 · exit ${launch.exit_code ?? '?'}</span>`;
+      else if (launch.state === 'exited') stateText = `<span class="pill live">已完成 · exit 0</span>`;
+      else if (launch.state === 'unknown') stateText = `<span class="pill">已结束 (未跟踪)</span>`;
+    }
+    box.innerHTML = parts.map((p) => `<span class="pill">${escapeHtml(p)}</span>`).join('') + stateText;
+    if (launch && launch.can_stop) {
+      const btn = document.createElement('button');
+      btn.textContent = '停止';
+      btn.title = '终止本看板启动的这个训练进程';
+      btn.onclick = () => stopRun();
+      box.appendChild(btn);
+    }
+  }
+
+  async function stopRun() {
+    if (!state.runId || !window.confirm('确定终止正在运行的训练？已产出的记录会保留。')) return;
+    try {
+      const res = await postApi('/api/stop', { id: state.runId });
+      setStatus(res.stopped ? '已发送终止信号' : '进程已结束');
+    } catch (err) {
+      setStatus('停止失败: ' + err.message);
+    }
+    setTimeout(() => openRun(state.runId), 800);
+  }
+
+  function stopConsole() {
+    if (state.consoleTimer) { clearInterval(state.consoleTimer); state.consoleTimer = null; }
+  }
+
+  async function pollConsole() {
+    if (!state.runId) return;
+    try {
+      const data = await api(`/api/log?id=${encodeURIComponent(state.runId)}&lines=400`);
+      const text = data.text || '';
+      const box = $('console');
+      // 只有变化时才重写 DOM, 否则滚动位置每 2 秒被重置一次
+      if (text !== state.__logText) {
+        state.__logText = text;
+        const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+        box.textContent = text || '（空）';
+        if (atBottom) box.scrollTop = box.scrollHeight;
+      }
+      $('console-hint').textContent = text ? `console.log · 最近 ${text.split('\n').length} 行` : 'console.log';
+      const launch = data.launch || null;
+      if (launch && (!state.launch || state.launch.state !== launch.state)) {
+        state.launch = launch;
+        renderChips({ meta: state.meta || {}, launch });
+      }
+    } catch (_) { /* 训练刚开始时日志可能还没建好, 忽略 */ }
+  }
+
+  function startConsole() {
+    stopConsole();
+    state.__logText = null;
+    pollConsole();
+    state.consoleTimer = setInterval(pollConsole, 2500);
   }
 
   function applyPayload(data, { replace = false } = {}) {
@@ -193,7 +306,8 @@
 
   function pickDefaultMetrics() {
     // 默认只选两条: "训练回报" 和 "泛化分数" —— 它们是决策依据, 且量纲接近, 不用归一化
-    const preferred = ['return', 'eval', 'max_stage', 'frames', 'steps', 'loss'];
+    // 不默认选 eval: 它和 return 常常是同一个数 (eval.jsonl 按 step 贴回来), 两条线会完全重合
+    const preferred = ['return', 'max_stage', 'frames', 'steps', 'loss'];
     const chosen = preferred.filter((m) => state.metrics.includes(m)).slice(0, 2);
     state.selected = new Set(chosen.length ? chosen : state.metrics.slice(0, 2));
   }
@@ -565,6 +679,135 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* 启动训练                                                            */
+  /* ------------------------------------------------------------------ */
+  async function loadRecipes() {
+    try {
+      const data = await api('/api/recipes');
+      state.recipes = data.recipes || [];
+      const select = $('recipe');
+      select.innerHTML = state.recipes
+        .map((r) => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.name)}</option>`)
+        .join('');
+      if (state.recipes.length) {
+        state.recipeId = state.recipes[0].id;
+        renderParams();
+      }
+    } catch (err) {
+      $('launch-msg').hidden = false;
+      $('launch-msg').textContent = '读取实验清单失败: ' + err.message;
+    }
+  }
+
+  function currentRecipe() {
+    return state.recipes.find((r) => r.id === state.recipeId) || null;
+  }
+
+  function renderParams() {
+    const recipe = currentRecipe();
+    const box = $('params');
+    box.innerHTML = '';
+    if (!recipe) return;
+    $('recipe-desc').textContent = recipe.description || '';
+    const cached = state.paramCache[recipe.id] || {};
+    for (const param of recipe.params) {
+      const value = Object.prototype.hasOwnProperty.call(cached, param.key) ? cached[param.key] : param.default;
+      const label = document.createElement('label');
+      label.className = 'form-row' + (param.kind === 'bool' ? ' chk' : '');
+      const name = document.createElement('span');
+      name.textContent = param.label || param.key;
+      label.appendChild(name);
+
+      let input;
+      if (param.kind === 'choice') {
+        input = document.createElement('select');
+        for (const choice of param.choices) {
+          const opt = document.createElement('option');
+          opt.value = choice;
+          opt.textContent = choice;
+          input.appendChild(opt);
+        }
+        input.value = value;
+      } else if (param.kind === 'bool') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = Boolean(value);
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        input.value = value;
+        input.step = param.kind === 'int' ? '1' : '0.01';
+        if (param.minimum != null) input.min = param.minimum;
+        if (param.maximum != null) input.max = param.maximum;
+      }
+      input.dataset.key = param.key;
+      input.addEventListener('change', () => {
+        state.paramCache[recipe.id] = collectParams();
+      });
+      label.appendChild(input);
+      box.appendChild(label);
+
+      if (param.help) {
+        const hint = document.createElement('div');
+        hint.className = 'hint';
+        hint.textContent = param.help;
+        box.appendChild(hint);
+      }
+    }
+  }
+
+  function collectParams() {
+    const out = {};
+    for (const input of $('params').querySelectorAll('[data-key]')) {
+      const key = input.dataset.key;
+      if (input.type === 'checkbox') out[key] = input.checked;
+      else if (input.type === 'number') out[key] = input.value === '' ? 0 : Number(input.value);
+      else out[key] = input.value;
+    }
+    return out;
+  }
+
+  function openLaunchModal() {
+    $('launch').hidden = false;
+    $('launch-msg').hidden = true;
+    $('launch-state').textContent = '';
+    if (!state.recipes.length) loadRecipes();
+    else renderParams();
+  }
+
+  function closeLaunchModal() {
+    $('launch').hidden = true;
+  }
+
+  async function doLaunch() {
+    const recipe = currentRecipe();
+    if (!recipe) return;
+    const button = $('launch-go');
+    button.disabled = true;
+    $('launch-state').textContent = '启动中…';
+    try {
+      const res = await postApi('/api/launch', {
+        recipe: recipe.id,
+        params: collectParams(),
+      });
+      $('launch-state').textContent = `已启动 pid ${res.launch?.pid ?? '?'}`;
+      closeLaunchModal();
+      // 启动后自动开实时: 曲线与控制台会跟着涨
+      state.live = true;
+      $('live').checked = true;
+      await loadRuns();
+      await openRun(res.run_id);
+      setStatus('训练已启动 · ' + recipe.name);
+    } catch (err) {
+      $('launch-msg').hidden = false;
+      $('launch-msg').textContent = '启动失败: ' + err.message;
+      $('launch-state').textContent = '';
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 事件绑定                                                            */
   /* ------------------------------------------------------------------ */
   function boot() {
@@ -606,8 +849,25 @@
       draw();
     };
 
+    $('launch-open').onclick = openLaunchModal;
+    $('launch-close').onclick = closeLaunchModal;
+    $('launch-go').onclick = doLaunch;
+    $('recipe').addEventListener('change', (event) => {
+      state.paramCache[state.recipeId] = collectParams();
+      state.recipeId = event.target.value;
+      renderParams();
+    });
+    $('launch').addEventListener('click', (event) => {
+      if (event.target === $('launch')) closeLaunchModal();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('launch').hidden) closeLaunchModal();
+    });
+
     // 有 ?run= 就打开指定 run, 否则自动打开最近一次 —— 打开就有图, 不用先点左边
-    const wanted = new URLSearchParams(window.location.search).get('run');
+    const params = new URLSearchParams(window.location.search);
+    const wanted = params.get('run');
+    if (params.get('launch') === '1') loadRecipes().then(openLaunchModal);
     loadRuns().then(() => {
       if (state.runId) return;
       if (wanted && state.runs.some((run) => run.id === wanted)) openRun(wanted);
