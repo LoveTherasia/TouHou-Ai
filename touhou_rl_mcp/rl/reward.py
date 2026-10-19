@@ -38,6 +38,25 @@ WEIGHT_DOCS: dict[str, str] = {
 #: 掉残后的默认无敌帧长度 (真机未标定 invincible 时的回退推断窗口)
 DEFAULT_INVINCIBLE_FRAMES = 150
 
+#: 实验用奖励覆盖 (具名 profile) —— 只写"偏离默认值"的项。
+#: config.json 的 ``reward`` 段是唯一默认值来源; 工具做实验时引用这里的 profile,
+#: 避免同一个实验在不同脚本里各写一套参数 (历史上 mock_clear / mock_train_clear
+#: 就因为自带 REWARD 而与 config.json 冲突, 导致实验结论不可比)。
+REWARD_PROFILES: dict[str, dict[str, float]] = {
+    # 真机第一面测试: 削弱 Boss 伤害权重 (避免站桩对轰), 保留符卡收取奖励
+    "real_stage1": {"boss_damage_scale": 0.01, "spell_capture_bonus": 20.0},
+}
+
+
+def reward_profile(name: str) -> dict[str, float]:
+    """取一份具名奖励覆盖 (返回副本, 调用方可以安全修改)。"""
+    try:
+        return dict(REWARD_PROFILES[name])
+    except KeyError:
+        raise KeyError(
+            f"未知的奖励 profile: {name}; 可用: {', '.join(sorted(REWARD_PROFILES))}"
+        ) from None
+
 
 @dataclass
 class RewardModel:
