@@ -214,6 +214,39 @@ class WallGap(Pattern):
                 game.spawn(24.0 + i * step, self.y, 0.0, self.speed)
 
 
+class ClosingRing(Pattern):
+    """闭合环 (收网): 以自机为中心生成一圈向内收缩的弹幕, 只留一个缺口。
+
+    与 ``dense_ring`` 的区别: 环是**围着自机**生成的, 站桩必死; 下缘会贴到底边,
+    所以"往下躲"不再安全。唯一的活路是找到缺口并在环收紧前穿出去 —— 这是
+    "主动找缝"能力的最小测试场景。
+    """
+
+    name = "closing_ring"
+    count = 24
+    radius = 170.0
+    speed = 1.0          # 向内收缩速度 (px/帧)
+    interval = 160       # 每多少帧收一层网
+    gap_slots = 2        # 缺口占几个槽位
+    start = 60           # 开局多少帧后开始
+
+    def update(self, game: Any) -> None:
+        if game.frame < self.start:
+            return
+        if (game.frame - self.start) % self.interval:
+            return
+        layer = (game.frame - self.start) // self.interval
+        gap = layer % self.count
+        cx, cy = game.px, game.py
+        for i in range(self.count):
+            if (i - gap) % self.count < self.gap_slots:
+                continue
+            a = 2.0 * math.pi * i / self.count
+            x = min(PLAYFIELD_WIDTH - 8.0, max(8.0, cx + math.cos(a) * self.radius))
+            y = min(PLAYFIELD_HEIGHT - 16.0, max(32.0, cy + math.sin(a) * self.radius))
+            game.spawn(x, y, -math.cos(a) * self.speed, -math.sin(a) * self.speed)
+
+
 class RandomSpray(Pattern):
     """随机方向爆散。"""
 
@@ -272,7 +305,7 @@ class AimedSpread(Pattern):
 _REGISTRY: dict[str, type[Pattern]] = {
     c.name: c for c in (
         DenseRing, ExpandingHomingRing, AimedTrail, StaticSwarm,
-        Spiral, Fan, WallGap, RandomSpray, Flower, AimedSpread,
+        Spiral, Fan, WallGap, ClosingRing, RandomSpray, Flower, AimedSpread,
     )
 }
 
@@ -285,6 +318,7 @@ PATTERN_DOCS: dict[str, str] = {
     "spiral": "多臂螺旋",
     "fan": "向下扇形",
     "wall_gap": "带缺口的横向弹幕墙",
+    "closing_ring": "闭合环: 围着自机收网, 只留一个缺口, 必须找缝穿出",
     "random_spray": "随机爆散",
     "flower": "n 重对称花弹",
     "aimed_spread": "自机狙 n 连",
