@@ -17,6 +17,7 @@
 | `research/gap_report.py` | 存活饱和时改看"飞行方式"（擦弹、最近弹距、横移占比） |
 | `research/aimed_probe.py` | 单颗斜向自机狙探针：检查策略是否把"自机所在车道"误判成安全 |
 | `research/viability_probe.py` | 时间展开 2D 可行集规划器：在完整 replay / 环形弹上找"还有没有活路" |
+| `research/value_distill.py` | V(s) 学习 + 短视界 beam search + 规划器示范蒸馏（实验性） |
 | `research/gap_benchmark.py` | 避弹基准：站着不动 vs 斥力老师 vs 时空规划器 |
 
 ```powershell
@@ -77,6 +78,14 @@
 # 未来生成已知的环形弹（规划器能找到上穿/横向对齐）
 .\.venv\Scripts\python.exe tools\research\viability_probe.py `
     --pattern ring_gate --dt 3 --horizon 120 --noop
+
+# V(s) + 规划器示范 + 蒸馏（实验性；结果见 docs/VALUE_DISTILL.md）
+.\.venv\Scripts\python.exe tools\research\value_distill.py --stage value `
+    --seeds 11,17 --max-frames 2400 --value-epochs 30
+.\.venv\Scripts\python.exe tools\research\value_distill.py --stage distill `
+    --seeds 11,17 --max-frames 2400 --depth 6 --beam 12 --epochs 100
+.\.venv\Scripts\python.exe tools\research\value_distill.py --stage eval `
+    --seeds 31,37 --max-frames 2400 --dt 3
 ```
 
 ## train — 训练入口
