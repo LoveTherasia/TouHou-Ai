@@ -143,5 +143,68 @@ class LaneSafetyTest(unittest.TestCase):
         self.assertGreater(lane_safety(state, GapSpec()), 0.9)
 
 
+def _two_wall_state(*, hole_front: float, hole_back: float,
+                    front_y: float = 320.0, back_y: float = 130.0,
+                    width: float = 44.0, vy: float = 2.05) -> GameState:
+    """两堵墙同时在屏 (前墙近、后墙远), 缺口位置可以不同。"""
+    bullets: list[tuple[float, float]] = []
+    for hole, y in ((hole_front, front_y), (hole_back, back_y)):
+        x = 12.0
+        while x <= 372.0:
+            if abs(x - hole) >= width / 2.0:
+                bullets.append((x, y))
+            x += 9.0
+    return GameState(
+        frame=100, in_game=True, player_x=192.0, player_y=416.0, lives=2,
+        bullets=bullets, raw={"bullet_velocity": [(0.0, vy)] * len(bullets)},
+    )
+
+
+class TtaLayersTest(unittest.TestCase):
+    """第 2 层剖面 = "下一堵墙什么时候到"。
+
+    间隔短、缺口横移大时 (v3), 自机必须在**上一堵墙还没落下**时就开始为下一堵墙
+    挪位。第 1 层是多颗弹取 min, 后一堵墙被前一堵完全遮住 —— 于是"现在整片都危险,
+    但下一堵墙在右边留了口子"这件事在第 1 层里完全不可见。
+    """
+
+    def test_second_layer_costs_exactly_one_profile(self) -> None:
+        base = GapSpec(use_grid=False, use_geo=True, use_clearance=False)
+        two = GapSpec(use_grid=False, use_geo=True, use_clearance=False, tta_layers=2)
+        self.assertEqual(GapObservation(two).dim - GapObservation(base).dim,
+                         base.tta_cols)
+
+    def test_second_layer_reveals_the_next_wall_gap(self) -> None:
+        # 前墙缺口在 90, 后墙缺口在 300: 站在 300 这一列, 现在马上被前墙盖住,
+        # 但后墙在这里是开的 —— 这正是"该往右准备"的信号。
+        state = _two_wall_state(hole_front=90.0, hole_back=300.0)
+        spec = GapSpec(use_grid=False, use_geo=True, use_clearance=False, tta_layers=2)
+        obs = GapObservation(spec)(state)
+        # 观测布局: [第1层 32][第2层 32][4 维几何]...
+        layer1, layer2 = obs[:spec.tta_cols], obs[spec.tta_cols:2 * spec.tta_cols]
+        col_next_gap = int(np.argmin(np.abs(_column_centers(spec) - 294.0)))
+        self.assertLess(float(layer1[col_next_gap]), 0.3, "前墙很近, 第 1 层应该是危险")
+        self.assertGreater(float(layer2[col_next_gap]), 0.9, "第 2 层看不到下一堵墙的缺口")
+
+    def test_both_layers_report_the_near_wall_first(self) -> None:
+        # 被两堵墙都盖住的车道: 第 1 层看前墙 (近), 第 2 层看后墙 (远)
+        state = _two_wall_state(hole_front=90.0, hole_back=300.0)
+        spec = GapSpec(use_grid=False, use_geo=True, use_clearance=False, tta_layers=2)
+        obs = GapObservation(spec)(state)
+        layer1, layer2 = obs[:spec.tta_cols], obs[spec.tta_cols:2 * spec.tta_cols]
+        col_walled = int(np.argmin(np.abs(_column_centers(spec) - 198.0)))
+        self.assertLess(float(layer1[col_walled]), 0.3)
+        self.assertGreater(float(layer2[col_walled]), float(layer1[col_walled]) + 0.2)
+
+    def test_single_layer_matches_the_old_profile(self) -> None:
+        # 默认层数必须与旧行为逐位一致, 否则历史策略的编码会静默改变
+        state = _wall_state(192.0, 416.0, hole_x=256.0, hole_width=60.0, wall_y=300.0)
+        spec = GapSpec(use_grid=False, use_geo=True, use_clearance=False)
+        obs = GapObservation(spec)(state)
+        pos, vel = _bullets(state)
+        self.assertTrue(np.allclose(obs[:spec.tta_cols],
+                                    _tta_profile(416.0, pos, vel, spec)))
+
+
 if __name__ == "__main__":
     unittest.main()

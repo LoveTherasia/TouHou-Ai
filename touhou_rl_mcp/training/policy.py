@@ -152,6 +152,18 @@ class MLPPolicy:
     def logits_batch(self, X: np.ndarray) -> np.ndarray:
         return self._forward_batch(np.asarray(X, dtype=np.float64))[2]
 
+    def snapshot_params(self) -> list[np.ndarray]:
+        """冻结一份当前参数, 作为 RL 微调的参考策略 (KL 锚)。"""
+        return [p.copy() for p in self._params]
+
+    def _logits_with_params(self, X: np.ndarray, params: list[np.ndarray]) -> np.ndarray:
+        """用另一套参数做前向 (参数布局与 ``_params`` 一致: W..., b..., Wv, bv)。"""
+        n = len(self.W)
+        h = X
+        for i in range(n - 1):
+            h = np.maximum(h @ params[i].T + params[n + i], 0.0)
+        return h @ params[n - 1].T + params[2 * n - 1]
+
     @staticmethod
     def _softmax_rows(logits: np.ndarray) -> np.ndarray:
         shifted = logits - logits.max(axis=1, keepdims=True)
@@ -187,6 +199,8 @@ class MLPPolicy:
         max_grad_norm: float = 5.0,
         target_kl: float = 0.0,
         seed: int | None = None,
+        ref_params: list[np.ndarray] | None = None,
+        kl_coef: float = 0.0,
     ) -> dict[str, float]:
         X = np.asarray(obs_batch, dtype=np.float64)
         a = np.asarray(actions, dtype=np.int64)
@@ -196,13 +210,13 @@ class MLPPolicy:
         n = X.shape[0]
         if n == 0:
             return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-                    "grad_norm": 0.0, "kl": 0.0, "clip_frac": 0.0}
+                    "grad_norm": 0.0, "kl": 0.0, "kl_ref": 0.0, "clip_frac": 0.0}
         coef = self.entropy_coef if entropy_coef is None else float(entropy_coef)
         rng = np.random.default_rng(self._t if seed is None else seed)
         mb = max(1, min(int(minibatch), n))
 
         agg = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-               "grad_norm": 0.0, "kl": 0.0, "clip_frac": 0.0}
+               "grad_norm": 0.0, "kl": 0.0, "kl_ref": 0.0, "clip_frac": 0.0}
         updates = 0
         stop = False
         for _ in range(max(1, int(epochs))):
@@ -215,6 +229,7 @@ class MLPPolicy:
                     X[idx], a[idx], old_logp[idx], adv[idx], ret[idx],
                     clip_ratio=clip_ratio, value_coef=value_coef,
                     entropy_coef=coef, max_grad_norm=max_grad_norm,
+                    ref_params=ref_params, kl_coef=kl_coef,
                 )
                 for k in agg:
                     agg[k] += stats.get(k, 0.0)
@@ -240,6 +255,8 @@ class MLPPolicy:
         value_coef: float,
         entropy_coef: float,
         max_grad_norm: float,
+        ref_params: list[np.ndarray] | None = None,
+        kl_coef: float = 0.0,
     ) -> dict[str, float]:
         m = X.shape[0]
         activations, _zs, logits = self._forward_batch(X)
@@ -260,6 +277,22 @@ class MLPPolicy:
         grad_logits = -grad_logp[:, None] * probs
         grad_logits[row, a] += grad_logp
         grad_logits += entropy_coef * probs * (np.log(np.maximum(probs, 1e-12)) + entropy[:, None])
+
+        # KL 锚: 把策略拴在"开始 RL 之前"的那份参数上。
+        #
+        # 实测 RL 阶段最大的问题不是学不会, 而是**忘掉** —— DAgger 已经到 1700+,
+        # 一段 PPO 之后回落到 1550。奖励只关心"多活几步", 而缺口感知是靠 60~160 局
+        # 监督堆出来的, 两边的梯度强度差一个量级。加一项 ``β·KL(π_ref ‖ π_θ)`` 之后,
+        # 策略只能在参考策略附近做局部修正, 监督学到的东西不会被一批样本抹掉。
+        # KL 对 logits 的梯度是 ``π_θ - π_ref`` (逐样本), 与下面按批求和再取平均的
+        # 缩放一致。
+        kl_ref = 0.0
+        if ref_params is not None and kl_coef > 0.0:
+            ref_probs = self._softmax_rows(self._logits_with_params(X, ref_params))
+            grad_logits += kl_coef * (probs - ref_probs)
+            kl_ref = float(np.mean(np.sum(
+                ref_probs * (np.log(np.maximum(ref_probs, 1e-12))
+                             - np.log(np.maximum(probs, 1e-12))), axis=1)))
 
         policy_loss = float(-np.minimum(ratio * adv, np.clip(ratio, lo, hi) * adv).mean())
         value_err = values - ret
@@ -294,7 +327,15 @@ class MLPPolicy:
                 g *= scale
         self._adam_step(grads)
 
-        kl = float(np.mean(old_logp - logp))
+        # KL 估计量必须**非负**, 否则 ``target_kl`` 早停永远不触发。
+        #
+        # 原来用的是 ``mean(old_logp - logp)`` —— 逐样本看它是无偏的, 但**每一条**
+        # 都可以是负数 (策略在某几个动作上概率变大), 于是均值在 0 附近来回抖, 早停
+        # 形同虚设; 而 RL 阶段恰恰需要这道闸 —— 没有它, 一批样本就能把 DAgger 学到
+        # 的感知冲掉。改用 Schulman 的二阶近似 ``E[(r-1) - log r]``: 对每个样本都
+        # ``>= 0``, 只在 r=1 时为 0。
+        safe_ratio = np.maximum(ratio, 1e-12)
+        kl = float(np.mean((safe_ratio - 1.0) - np.log(safe_ratio)))
         clip_frac = float(np.mean(np.abs(ratio - 1.0) > clip_ratio))
         return {
             "policy_loss": policy_loss,
@@ -302,6 +343,7 @@ class MLPPolicy:
             "entropy": float(entropy.mean()),
             "grad_norm": total,
             "kl": kl,
+            "kl_ref": kl_ref,
             "clip_frac": clip_frac,
         }
 

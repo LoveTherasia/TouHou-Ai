@@ -67,6 +67,10 @@ class GapSpec:
     tta_band: float = 26.0
     tta_horizon: int = 240
     tta_step: int = 3
+    #: TTA 剖面的层数。1 = 只看"最早被威胁"; 2 = 再拼一层"这一列**下一堵墙**什么时候
+    #: 到"。间隔小于"缺口横移所需时间"时 (v3), 必须提前为下一堵墙占位, 而最早到达
+    #: 时间被前一堵墙完全遮住 —— 两层剖面是唯一能看到下一堵墙缺口的几何量。
+    tta_layers: int = 1
     #: 是否拼接两类观测
     use_grid: bool = True
     use_geo: bool = True
@@ -204,6 +208,29 @@ def _tta_profile(py: float, pos: np.ndarray, vel: np.ndarray,
     return np.clip(t1 / float(max(1, spec.tta_horizon)), 0.0, 1.0)
 
 
+def _tta_profiles(py: float, pos: np.ndarray, vel: np.ndarray,
+                  spec: GapSpec) -> np.ndarray:
+    """多层 TTA 剖面, 形状 ``(layers*tta_cols,)``, 每层归一化到 [0, 1]。
+
+    第 2 层是"这一列**第二堵墙**什么时候到"。为什么需要它: 多层到达时间取 min 之后,
+    后一堵墙的信息被前一堵墙彻底遮住 —— 间隔 75 帧、缺口横移 324px 时, 自机必须
+    在**上一堵墙还没落下**的时候就开始为下一堵墙挪位, 而只看第 1 层的剖面在那段
+    时间里是"整片都被封死"的同一个图案, 策略无从判断该往哪边准备。
+
+    第 2 层里"值高"的车道 = 前一堵墙打穿它、但下一堵墙留了缺口 —— 也就是下一堵墙
+    的缺口位置。这正是 v3 那种大漂移场景唯一需要的先见量。
+
+    目前最多 2 层 (``_arrival_times`` 只给前两次到达), 更多层没有对应的物理量。
+    """
+    cols = spec.tta_cols
+    layers = max(1, int(spec.tta_layers))
+    horizon = float(max(1, spec.tta_horizon))
+    t1, t2 = _arrival_times(py, pos, vel, spec)
+    if layers == 1:
+        return np.clip(t1 / horizon, 0.0, 1.0)
+    return np.clip(np.concatenate([t1, t2]) / horizon, 0.0, 1.0)[: layers * cols]
+
+
 def _column_centers(spec: GapSpec) -> np.ndarray:
     """每条车道的中心 x (场地绝对坐标, 与自机位置无关)。"""
     cell = float(PLAYFIELD_WIDTH) / spec.tta_cols
@@ -291,7 +318,7 @@ def gap_observation_dim(spec: GapSpec) -> int:
     if spec.use_grid:
         dim += len(spec.horizons) * spec.rows * spec.cols
     if spec.use_geo:
-        dim += spec.tta_cols + 4
+        dim += spec.tta_cols * max(1, int(spec.tta_layers)) + 4
     if spec.use_clearance:
         dim += len(DIRECTIONS) * 2          # 6 帧 + 12 帧
     dim += _globals(GameState(), 0.0, 0.0).shape[0]
@@ -330,9 +357,12 @@ class GapObservation:
             _grid_layers(px, py, pos, vel, spec, grid)
             off += cells
         if spec.use_geo:
-            profile = _tta_profile(py, pos, vel, spec)
-            vec[off:off + spec.tta_cols] = profile
-            off += spec.tta_cols
+            cols = spec.tta_cols
+            layers = max(1, int(spec.tta_layers))
+            profiles = _tta_profiles(py, pos, vel, spec)
+            vec[off:off + cols * layers] = profiles
+            profile = profiles[:cols]          # 几何特征只看第 1 层 (眼前这堵墙)
+            off += cols * layers
             vec[off:off + 4] = _gap_features(profile, px, spec)
             off += 4
         if spec.use_clearance:

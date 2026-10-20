@@ -449,6 +449,7 @@ def gap_spec_from(config: Any) -> GapSpec:
         use_geo=bool(getattr(config, "gap_geo", True)),
         use_clearance=bool(getattr(config, "gap_clearance", True)),
         use_prev_action=bool(getattr(config, "gap_prev_action", True)),
+        tta_layers=int(getattr(config, "gap_layers", 1) or 1),
     )
 
 

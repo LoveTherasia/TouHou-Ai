@@ -149,6 +149,61 @@ class TestActionAndAlgorithm(unittest.TestCase):
         self.assertTrue(all(np.isfinite(v) for v in stats.values()))
         self.assertIn("kl", stats)
 
+    def test_kl_is_non_negative_so_early_stop_can_fire(self) -> None:
+        """回归: KL 曾用 ``mean(old_logp - logp)``, 逐样本可负 → 早停从不触发。
+
+        ``target_kl`` 是 RL 阶段唯一的护栏 (防止一批样本把监督学到的策略冲掉),
+        所以这个量必须是"偏离程度"而不是"有符号的差"。
+        """
+        policy = MLPPolicy(8, 3, hidden=(16,), seed=0, lr=0.5)
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((128, 8))
+        actions = rng.integers(0, 3, 128)
+        logp, _ent, _val = policy.evaluate(X, actions)
+        # 大步长 + 多轮: 必然大幅偏离, 若 kl 还能为负说明用错了估计量
+        stats = policy.update_ppo(X, actions, logp, np.ones(128), np.zeros(128),
+                                  epochs=8, minibatch=64, max_grad_norm=0.0)
+        self.assertGreaterEqual(stats["kl"], 0.0)
+
+    def test_kl_anchor_keeps_the_policy_near_the_reference(self) -> None:
+        """RL 阶段要能"跟奖励走一点, 但别忘掉监督学到的"。
+
+        没锚时 PPO 一次就能把策略推得很远 (实测 v3 上 DAgger 1764 -> RL 1592),
+        因为缺口感知是几百局监督堆出来的, 奖励梯度量级完全不同。
+        """
+        def kl_after(kl_coef: float) -> float:
+            policy = MLPPolicy(8, 3, hidden=(16,), seed=0, lr=0.3)
+            rng = np.random.default_rng(3)
+            X = rng.standard_normal((128, 8))
+            actions = rng.integers(0, 3, 128)
+            logp, _ent, _val = policy.evaluate(X, actions)
+            ref = policy.snapshot_params()
+            stats = policy.update_ppo(X, actions, logp, np.ones(128), np.zeros(128),
+                                      epochs=6, minibatch=64, max_grad_norm=0.0,
+                                      ref_params=ref, kl_coef=kl_coef)
+            # 用"相对采样时策略的 KL"来衡量这一批把策略推了多远
+            return stats["kl"]
+
+        self.assertLess(kl_after(5.0), kl_after(0.0) / 3.0,
+                        "KL 锚没有把策略拴住")
+
+    def test_target_kl_actually_limits_the_update(self) -> None:
+        # 同一个初始策略, 紧的 KL 预算必须比松的预算走得更近 (参数变化更小)
+        def drift(target_kl: float) -> float:
+            policy = MLPPolicy(8, 3, hidden=(16,), seed=0, lr=0.5)
+            rng = np.random.default_rng(2)
+            X = rng.standard_normal((128, 8))
+            actions = rng.integers(0, 3, 128)
+            logp, _ent, _val = policy.evaluate(X, actions)
+            before = [p.copy() for p in policy._params]
+            policy.update_ppo(X, actions, logp, np.ones(128), np.zeros(128),
+                              epochs=8, minibatch=64, target_kl=target_kl,
+                              max_grad_norm=0.0)
+            return float(sum(np.abs(p - q).sum()
+                             for p, q in zip(policy._params, before)))
+
+        self.assertLess(drift(0.01), drift(100.0))
+
     def test_default_config_uses_focus_and_ppo(self) -> None:
         from touhou_rl_mcp.training import TrainConfig
         cfg = TrainConfig()

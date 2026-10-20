@@ -137,6 +137,9 @@ class TrainConfig:
     gap_clearance: bool = True
     #: use_gap 时把上一动作 one-hot 拼进观测 (宏动作有承诺期, 策略要知道自己的动量)
     gap_prev_action: bool = True
+    #: TTA 剖面层数。2 = 再拼一层"下一堵墙什么时候到", 大漂移基准上必须开
+    #: (第 1 层被眼前这堵墙遮死, 看不到下一堵墙的缺口在哪)
+    gap_layers: int = 1
     #: 缺口老师的标签口径: now / reach / future / slack (见 training/gap_label.py)
     gap_label: str = "reach"
     #: 基准场景参数 (写进 mock 的弹型对象), 例如 wall_gate 的
@@ -162,6 +165,10 @@ class TrainConfig:
     gae_lambda: float = 0.95
     #: PPO KL 早停阈值 (0=关闭): 单批 KL 超过它就停止本批剩余 epoch, 防止策略退化
     target_kl: float = 0.05
+    #: RL 阶段到"监督结束时那份参数"的 KL 锚系数 (0=关闭)。
+    #: 不开它时, PPO 会把 DAgger 学到的缺口感知冲掉 (实测 1764 -> 1592);
+    #: 0.5 ~ 2 之间既能跟奖励走, 又不会忘。
+    kl_anchor: float = 0.0
     #: 模仿学习每个 batch 重复几次梯度 (BC/DAgger 收敛更快)
     teacher_epochs: int = 8
     #: 危险状态加权: 离最近弹幕越近, 模仿损失权重越大 (0=不加权)
@@ -293,6 +300,8 @@ class Trainer:
     ) -> None:
         self.env = env
         self.config = config or TrainConfig()
+        #: RL 阶段 KL 锚用的参考参数 (监督阶段结束时冻结)
+        self._rl_ref: list[Any] | None = None
         if self.config.rotate_loadouts and getattr(env.spec, "key", None) != "th11":
             raise ValueError("六机体轮换目前仅支持 TH11")
         self.env_lock = env_lock or threading.RLock()
@@ -416,11 +425,18 @@ class Trainer:
             or new_config.gap_geo != self.config.gap_geo
             or new_config.gap_clearance != self.config.gap_clearance
             or new_config.gap_prev_action != self.config.gap_prev_action
+            or new_config.gap_layers != self.config.gap_layers
             or new_config.grid_size != self.config.grid_size
             or new_config.grid_span != self.config.grid_span
             or new_config.grid_scales != self.config.grid_scales
         )
         self.config = new_config
+        # 从"有老师"切到"没老师" = 进入 RL 阶段: 此刻冻结参考策略, 给 PPO 一个锚。
+        # 必须在这一刻抓, 抓早了是随机的初始策略, 抓晚了已经被 RL 改过。
+        if (patch.get("teacher") is not None and not str(new_config.teacher).strip()
+                and self.config.kl_anchor > 0):
+            with self.policy_lock:
+                self._rl_ref = self.policy.snapshot_params()
         self.policy.lr = new_config.lr
         self.policy.entropy_coef = new_config.entropy_coef
         if rebuild:
@@ -866,6 +882,8 @@ class Trainer:
                 value_coef=float(self.config.value_coef),
                 entropy_coef=float(self.config.entropy_coef),
                 target_kl=float(getattr(self.config, "target_kl", 0.05)),
+                ref_params=self._rl_ref,
+                kl_coef=float(getattr(self.config, "kl_anchor", 0.0)),
             )
         stats["value_scale"] = round(scale, 4)
         return stats

@@ -59,6 +59,29 @@ ARMS: dict[str, dict[str, bool]] = {
 }
 
 
+def random_ranges(base: dict[str, float]) -> dict[str, list[float]]:
+    """按基准场景派生**训练用**的参数区间 (域随机化)。
+
+    为什么必须随机化: 只用 ``{"gap_phase": [0, 1]}`` 时, 间隔/弹速/漂移/缺口宽度
+    都是写死的, 留出场景 (反向漂移、更快弹速、更短间隔) 全部落在训练分布之外 ——
+    这时"泛化帧数"测的是运气, 不是能力。把它们的区间张开, 策略才没得背, 只能学
+    "看缺口、提前占位"这件事本身。
+
+    区间按相对比例取, 这样 v1/v2/v3 同一套代码都能用。
+    """
+    interval = float(base.get("interval", 75.0))
+    speed = float(base.get("speed", 2.0))
+    width = float(base.get("gap_width", 44.0))
+    return {
+        "gap_phase": [0.0, 1.0],
+        # 漂移**含符号**: 左右横移都要会, 否则遇到反向的墙只会往错的方向跑
+        "gap_drift": [-0.95, 0.95],
+        "interval": [interval * 0.90, interval * 1.10],
+        "speed": [speed * 0.93, speed * 1.10],
+        "gap_width": [width * 0.90, width * 1.10],
+    }
+
+
 # ----------------------------------------------------------------------
 def build_env(scenario: dict[str, float], reward: dict[str, float]) -> TouhouEnv:
     cfg = Config.load()
@@ -81,8 +104,7 @@ def build_env(scenario: dict[str, float], reward: dict[str, float]) -> TouhouEnv
 def make_trainer(env: TouhouEnv, args: argparse.Namespace,
                  scenario: dict[str, float], *, teacher: str,
                  out_dir: Path) -> Trainer:
-    config = TrainConfig(
-        algorithm="ppo",
+    config = TrainConfig(        algorithm="ppo",
         episodes=0,
         max_steps=max(1, args.max_frames // COMMIT_FRAMES),
         step_frames=COMMIT_FRAMES,
@@ -96,15 +118,19 @@ def make_trainer(env: TouhouEnv, args: argparse.Namespace,
         use_gap=True,
         **ARMS[args.arm],
         gap_prev_action=True,
+        gap_layers=args.gap_layers,
         gap_label=args.label,
         scenario=dict(scenario),
         # 缺口相位每局重采: 否则 2400 帧的基准退化成"同一个局面重复 N 次"
-        scenario_random={"gap_phase": [0.0, 1.0]},
+        # --rand 再把间隔/弹速/缺口宽度/漂移方向一起张开 (域随机化)
+        scenario_random=(random_ranges(scenario) if args.rand
+                         else {"gap_phase": [0.0, 1.0]}),
         teacher=teacher,
         dagger_beta=args.dagger_beta,
         teacher_epochs=args.teacher_epochs,
         ppo_epochs=args.ppo_epochs,
         ppo_minibatch=args.minibatch,
+        kl_anchor=args.kl_anchor,
         eval_every=0,                  # 留出场景评估由本脚本控制
         plot_every=0,
         capture_every=0,
@@ -119,16 +145,23 @@ def make_trainer(env: TouhouEnv, args: argparse.Namespace,
 # ----------------------------------------------------------------------
 def evaluate(env: TouhouEnv, trainer: Trainer,
              heldout: tuple[dict[str, float], ...], *, max_frames: int,
-             label_mode: str, seeds: tuple[int, ...] = (101,)) -> dict[str, Any]:
-    """在**未见过的**场景上贪心跑一局, 回来存活帧数 / 与标签的一致率。"""
+             label_mode: str, phases: tuple[float, ...] = (0.0,)) -> dict[str, Any]:
+    """在**未见过的**场景上贪心跑, 回来存活帧数 / 与标签的一致率。
+
+    ``phases`` 是叠加在场景 ``gap_phase`` 上的相位偏移。**必须多于一个**: 弹幕墙
+    每堵横移 ``drift*360`` px, 初始相位差 1/3 就是完全不同的死法, 3 局平均的
+    方差足以把"学会"和"运气好"混在一起。v3 上实测同一策略的局间极差能到 900 帧。
+    """
     enc = gap_encoder(trainer.config)
     spec = gap_spec_from(trainer.config)
     frames: list[int] = []
     agree: list[float] = []
     for scenario in heldout:
-        for seed in seeds:
-            state = env.reset(seed=seed).state
-            apply_scenario(env, scenario)
+        for offset in phases:
+            sc = dict(scenario)
+            sc["gap_phase"] = float(sc.get("gap_phase", 0.0)) + float(offset)
+            state = env.reset(seed=101).state
+            apply_scenario(env, sc)
             survival = 0
             prev = -1
             hits = total = 0
@@ -150,6 +183,7 @@ def evaluate(env: TouhouEnv, trainer: Trainer,
     return {
         "frames": frames,
         "mean": float(np.mean(frames)) if frames else 0.0,
+        "min": float(np.min(frames)) if frames else 0.0,
         "agree": float(np.mean(agree)) if agree else 0.0,
     }
 
@@ -175,7 +209,8 @@ def _write_row(path: Path, step: int, name: str, score: float,
 
 
 def _fmt(result: dict[str, Any]) -> str:
-    return (f"泛化 {result['mean']:6.0f} 帧  一致率 {result['agree']:4.0%}  "
+    return (f"泛化 {result['mean']:6.0f} 帧 (最差 {result['min']:4.0f})  "
+            f"一致率 {result['agree']:4.0%}  "
             f"{[int(x) for x in result['frames']]}")
 
 
@@ -191,7 +226,15 @@ def main() -> int:
                          "default = 不改奖励, 用 config.json 那套")
     ap.add_argument("--gap-margin", type=float, default=0.0,
                     help="缺口余量的势函数塑形系数 (0=关; 2~5 给'别站着不动'密集梯度)")
+    ap.add_argument("--gap-layers", type=int, default=1, choices=(1, 2),
+                    help="TTA 剖面层数: 2 = 再拼一层下一堵墙的到达时间 "
+                         "(大漂移基准上, 第 1 层看不到下一堵墙的缺口)")
     ap.add_argument("--bc-episodes", type=int, default=30, help="纯模仿 (BC) 局数")
+    ap.add_argument("--rand", action="store_true",
+                    help="域随机化: 训练时随机化 间隔/弹速/缺口宽度/漂移方向 "
+                         "(不开则只随机缺口相位, 留出场景基本在分布外)")
+    ap.add_argument("--eval-phases", type=int, default=3,
+                    help="每个留出场景叠加多少个相位偏移 (1=只有原相位, 噪声很大)")
     ap.add_argument("--dagger-episodes", type=int, default=0,
                     help="DAgger 局数 (>0 时用策略自己的轨迹补标签)")
     ap.add_argument("--rl-episodes", type=int, default=0, help="BC/DAgger 之后的 PPO 局数")
@@ -205,6 +248,10 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--entropy", type=float, default=0.01)
     ap.add_argument("--hidden", type=int, default=64, help="隐层宽度 (0=线性)")
+    ap.add_argument("--kl-anchor", type=float, default=0.0,
+                    help="RL 阶段到监督结束时策略的 KL 锚系数 (0=关)。"
+                         "实测不开时 PPO 会把 DAgger 的缺口感知冲掉 "
+                         "(v3: 1764 -> 1592)")
     ap.add_argument("--teacher-epochs", type=int, default=6)
     ap.add_argument("--ppo-epochs", type=int, default=4)
     ap.add_argument("--ppo-minibatch", "--minibatch", type=int, default=256, dest="minibatch")
@@ -231,15 +278,20 @@ def main() -> int:
     trainer = make_trainer(env, args, train_scenario, teacher="", out_dir=out_dir)
 
     print(f"bench={args.bench}  label={args.label}  arm={args.arm}  "
-          f"reward={args.reward}  gap_margin={args.gap_margin}")
+          f"reward={args.reward}  gap_margin={args.gap_margin}  rand={args.rand}")
     print(f"obs_dim={trainer.obs_dim}  actions={len(trainer.action_table)}  "
           f"run={out_dir}")
     print(f"train scenario: {train_scenario}")
+    if args.rand:
+        print(f"train ranges: {random_ranges(train_scenario)}")
 
     meta: dict[str, Any] = {
         "script": "tools/research/gap_trainer.py",
         "bench": args.bench, "label": args.label, "arm": args.arm,
         "reward": args.reward, "gap_margin": args.gap_margin,
+        "rand": bool(args.rand),
+        "train_ranges": (random_ranges(train_scenario) if args.rand
+                         else {"gap_phase": [0.0, 1.0]}),
         "obs_dim": trainer.obs_dim,
         "train_scenario": train_scenario,
         "heldout": [dict(s) for s in heldout],
@@ -255,11 +307,16 @@ def main() -> int:
     def step_index() -> int:
         return len(trainer.episodes)
 
+    #: 相位偏移: 0 加上均匀切分的其余相位, 每个场景多跑几局
+    phase_offsets = tuple(
+        i / max(1, args.eval_phases) for i in range(max(1, args.eval_phases)))
+
     def eval_and_log(tag: str) -> dict[str, Any]:
         result = evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                          label_mode=args.label)
+                          label_mode=args.label, phases=phase_offsets)
         _write_row(eval_path, step_index(), tag, result["mean"], result["frames"],
-                   agree=round(result["agree"], 4))
+                   agree=round(result["agree"], 4),
+                   min_frames=round(result["min"], 1))
         print(f"  [{tag}] {_fmt(result)}", flush=True)
         return result
 
@@ -305,8 +362,9 @@ def main() -> int:
         eval_and_log("untrained")
     trainer.save()
     final = evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                     label_mode=args.label)
+                     label_mode=args.label, phases=phase_offsets)
     meta["final"] = {"mean_frames": round(final["mean"], 1),
+                     "min_frames": round(final["min"], 1),
                      "agree": round(final["agree"], 4),
                      "detail": [int(x) for x in final["frames"]]}
     flush_meta()
