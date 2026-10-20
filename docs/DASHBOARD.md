@@ -61,6 +61,7 @@
 | `gap_bc` | 缺口学习 · 仅弱监督（离线 BC / DAgger） |
 | `gap_bc_rl` | 缺口学习 · 弱监督 + RL（BC 锚定微调） |
 | `gap_rl` | 缺口学习 · 纯 RL（对照） |
+| `gap_trainer` | 缺口学习 · **正式训练器**（BC → DAgger → PPO，`use_gap` 观测 + 缺口老师 + 可选新奖励） |
 
 几个实现细节：
 

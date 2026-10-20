@@ -31,6 +31,8 @@ WEIGHT_DOCS: dict[str, str] = {
     "danger_radius": "危险度感知半径(像素), 不是权重, 只是一个参数",
     "alive_bonus": "每个 step 的存活奖励 —— 把稀疏的死亡惩罚变成密集信号, 学习会快很多",
     "time_penalty": "每个 step 的固定惩罚, 鼓励速通",
+    "gap_margin_scale": ("缺口余量的势函数塑形: 奖励 += scale * (φ' - φ), φ = 自机所在车道"
+                         "的安全余量。势函数不改变最优策略, 只给'站着不动'一个密集负梯度"),
     "clip": "单步奖励裁剪上限 (null 表示不裁剪)",
     "shaping_scale": "所有分量的整体缩放, Agent 在线调参入口",
 }
@@ -45,6 +47,30 @@ DEFAULT_INVINCIBLE_FRAMES = 150
 REWARD_PROFILES: dict[str, dict[str, float]] = {
     # 真机第一面测试: 削弱 Boss 伤害权重 (避免站桩对轰), 保留符卡收取奖励
     "real_stage1": {"boss_damage_scale": 0.01, "spell_capture_bonus": 20.0},
+    # 缺口生存 (wall_gate 等"活下来就是目标"的基准): 过面进度 + 擦弹 - 碰撞。
+    # **必须关掉 danger_scale**: 斥力项教的是"离弹越远越好", 而密集弹幕里"远"只有
+    # 墙角 —— 这正是"被逼到角落再被弹"的成因。耗时/速通/输出项一并归零, 否则
+    # 策略会拿"站着不动攒输出"换生存。实测依据见 docs/GAP_LEARNING.md。
+    "gap_survive": {
+        "alive_bonus": 1.0,          # 过面进度: 每多活一步 +1 (2400 帧上限 ≈ 400 步)
+        "graze_scale": 0.05,         # 擦弹: 主动贴缝穿过才有, 是"找缝"的密集信号
+        "miss_penalty": -40.0,       # 碰撞: 一次掉残 ≈ 40 步生存, 足够重但不致于瘫痪
+        "death_penalty": -40.0,      # Game Over
+        "danger_scale": 0.0,         # 关键: 关掉斥力 (它会把人赶进墙角)
+        "time_penalty": 0.0,         # 不做速通压力
+        "score_scale": 0.0,
+        "power_scale": 0.0,
+        "boss_damage_scale": 0.0,
+        "spell_capture_bonus": 0.0,
+        "spell_clear_bonus": 0.0,
+        "life_bonus": 0.0,
+        "stage_clear_bonus": 0.0,
+        "game_clear_bonus": 0.0,
+        "clip": 100.0,
+        # profile 是"整份覆盖"的起点: 漏掉 shaping_scale 会让总奖励恒为 0
+        # (RewardModel 里所有未列出的权重默认 0.0, 包括这个整体缩放)。
+        "shaping_scale": 1.0,
+    },
 }
 
 
@@ -66,6 +92,8 @@ class RewardModel:
         self.weights = {**{k: 0.0 for k in WEIGHT_DOCS}, **(self.weights or {})}
         #: 回退推断无敌帧用: 最近一次掉残的帧号 (真机未标定 invincible 时)
         self._hit_frame: int | None = None
+        #: 缺口势函数的上一帧 φ (None = 还没建立基线 / 刚换局)
+        self._gap_phi: float | None = None
 
     # ------------------------------------------------------------------
     def update_weights(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +178,9 @@ class RewardModel:
         danger = self._danger(cur)
         if danger:
             parts["danger"] = danger
+        margin = self._gap_margin(prev, cur)
+        if margin:
+            parts["gap"] = margin
 
         total = sum(parts.values()) * self._w("shaping_scale", 1.0)
         clip = self.weights.get("clip")
@@ -192,6 +223,35 @@ class RewardModel:
             return False
         window = self._w("invincible_frames", float(DEFAULT_INVINCIBLE_FRAMES))
         return 0 <= (frame - self._hit_frame) < window
+
+    # ------------------------------------------------------------------
+    def _gap_margin(self, prev: GameState | None, cur: GameState) -> float:
+        """缺口势函数塑形: ``scale * (φ' − φ)``, φ = 自机所在车道的安全余量。
+
+        为什么用势函数而不是直接奖励 φ: 势函数差分的累积回报只取决于首尾 (望远镜
+        求和), **不改变最优策略**, 所以它不会像 ``danger_scale`` 那样把策略改造成
+        "离弹越远越好" —— 那在密集弹幕里等价于"缩到墙角"。
+
+        换局时 (帧号回退) 只重建基线, 不产生跨局的大额跳变。
+        """
+        scale = self._w("gap_margin_scale")
+        if scale == 0.0:
+            return 0.0
+        if cur.player_x is None or cur.player_y is None or not cur.bullets:
+            return 0.0
+        try:
+            from ..training.occupancy import lane_safety
+
+            phi = lane_safety(cur)
+        except Exception:  # pragma: no cover - 观测缺失时不影响其它奖励
+            return 0.0
+        previous = self._gap_phi
+        frame = int(cur.frame or 0)
+        prev_frame = int(prev.frame or 0) if prev is not None else -1
+        self._gap_phi = phi
+        if previous is None or prev is None or frame < prev_frame:
+            return 0.0
+        return scale * (phi - previous)
 
     # ------------------------------------------------------------------
     def _danger(self, state: GameState) -> float:

@@ -11,11 +11,16 @@
 | 脚本 | 用途 |
 |---|---|
 | `research/gap_rl.py` | 缺口任务最小学习实验：观测对照 / 感知弱监督 / BC 锚，写标准 run 记录 |
+| `research/gap_trainer.py` | 同一批实验走**正式训练链路**（Trainer）：`use_gap` 观测 + 新奖励 + 缺口老师，BC→DAgger→PPO 分阶段 |
 | `research/gap_benchmark.py` | 避弹基准：站着不动 vs 斥力老师 vs 时空规划器 |
 
 ```powershell
 .\.venv\Scripts\python.exe tools\research\gap_rl.py --arm geo --updates 25 `
     --bc-episodes 30 --bc-epochs 8 --bc-coef 2.0 --shaping 2.0
+
+# 正式链路: 缺口观测 + 过面进度奖励 + slack 标签, 留出场景评估
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py --bench v2 --label slack `
+    --reward gap_survive --bc-episodes 30 --dagger-episodes 60 --rl-episodes 200
 ```
 
 ## train — 训练入口

@@ -115,6 +115,76 @@ def _grid_layers(px: float, py: float, pos: np.ndarray, vel: np.ndarray,
             out[li, iy[ok], ix[ok]] = 1.0
 
 
+def _arrival_times(py: float, pos: np.ndarray, vel: np.ndarray,
+                   spec: GapSpec, *, min_gap: float = 12.0
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """每条车道**前两次**被弹幕威胁的时刻 (帧), 越大越安全。
+
+    返回 ``(t1, t2)``:
+
+    * ``t1``: 第一次到达时间 —— 就是 TTA 剖面本身;
+    * ``t2``: 第二次到达时间 (与第一次相隔至少 ``min_gap`` 帧), 用来回答"站在这里
+      不动的话, 我还有多久可以挪窝"。
+
+    只有第一次到达是不够的: 一条车道可能 30 帧后被打穿、60 帧后又空出来, 也可能
+    30 帧后被打穿、下一堵墙马上又盖住它。"待得住多久"必须看第二次 —— 这就是
+    ``slack`` 标签比 ``reach`` 多出来的那一维。
+    """
+    cols = spec.tta_cols
+    centers = _column_centers(spec)
+    reach = HITBOX_RADIUS + BULLET_RADIUS
+    never = float(spec.tta_horizon + spec.tta_step)
+    t1 = np.full(cols, never)
+    t2 = np.full(cols, never)
+
+    # 场地外 / 自机到不了的列: 直接判为"立刻被占", 不给出虚假的安全感
+    reachable = (centers >= 8.0) & (centers <= PLAYFIELD_WIDTH - 8.0)
+    t1[~reachable] = 0.0
+    t2[~reachable] = 0.0
+    if pos.shape[0] == 0:
+        return t1, t2
+
+    ts = np.arange(0, spec.tta_horizon + 1, spec.tta_step, dtype=np.float64)
+    xs = pos[:, 0][None, :] + vel[:, 0][None, :] * ts[:, None]
+    ys = pos[:, 1][None, :] + vel[:, 1][None, :] * ts[:, None]
+    hot = (np.abs(ys - py) <= spec.tta_band) & (xs >= -reach) & \
+          (xs <= PLAYFIELD_WIDTH + reach)
+    if not np.any(hot):
+        return t1, t2
+
+    valid = hot.any(axis=0)
+    if not np.any(valid):
+        return t1, t2
+    idx = np.flatnonzero(valid)
+    first = np.argmax(hot, axis=0)[idx]     # 每颗弹首次进入带宽的时刻下标
+    t_first = ts[first]
+    x_first = xs[first, idx]
+    # **按车道区间与危险区是否相交**来判定, 而不是"车道中心是否落在危险区内"。
+    #
+    # 这条是踩过的坑: 车道 12px、判定半径 5px, 中心只覆盖 10px。—— 一颗落在两个
+    # 中心正中间 (比如 x=12, 中心在 6 和 18) 的弹, 两颗中心都离它 6px > 5px, 于是
+    # **整颗弹在剖面里凭空消失**。9px 间距的墙大约每 4 颗就有 1 颗落在这种 2px 盲区
+    # 里, 观测于是把"其实封死"的车道报成安全 —— 策略学到的是一个不存在的缺口。
+    cell = float(PLAYFIELD_WIDTH) / max(1, cols)
+    lo = np.clip(np.floor((x_first - reach) / cell).astype(np.intp), 0, cols - 1)
+    hi = np.clip(np.floor((x_first + reach) / cell).astype(np.intp), 0, cols - 1)
+    for i in range(idx.shape[0]):
+        np.minimum(t1[lo[i]:hi[i] + 1], t_first[i], out=t1[lo[i]:hi[i] + 1])
+
+    # 第二次到达: 展开成 (弹, 车道) 对, 过滤掉与第一次太近的, 再按车道取最小
+    lengths = hi - lo + 1
+    total = int(lengths.sum())
+    if total:
+        starts = np.repeat(lo, lengths)
+        offsets = np.arange(total) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        pair_cols = starts + offsets
+        pair_times = np.repeat(t_first, lengths)
+        mask = pair_times > t1[pair_cols] + min_gap
+        if np.any(mask):
+            np.minimum.at(t2, pair_cols[mask], pair_times[mask])
+    return t1, t2
+
+
 def _tta_profile(py: float, pos: np.ndarray, vel: np.ndarray,
                  spec: GapSpec) -> np.ndarray:
     """每列"最早被弹幕威胁"的时间 (帧), 归一化到 [0, 1], 越接近 1 越安全。
@@ -130,36 +200,8 @@ def _tta_profile(py: float, pos: np.ndarray, vel: np.ndarray,
 
     单调性同样重要: ``1/(1+t)`` 是递减的, 会把缺口变成最低点, 语义正好相反。
     """
-    cols = spec.tta_cols
-    centers = _column_centers(spec)
-    reach = HITBOX_RADIUS + BULLET_RADIUS
-    never = float(spec.tta_horizon + spec.tta_step)
-    tta = np.full(cols, never)
-
-    # 场地外 / 自机到不了的列: 直接判为"立刻被占", 不给出虚假的安全感
-    reachable = (centers >= 8.0) & (centers <= PLAYFIELD_WIDTH - 8.0)
-    tta[~reachable] = 0.0
-
-    if pos.shape[0] == 0:
-        return np.clip(tta / spec.tta_horizon, 0.0, 1.0)
-    ts = np.arange(0, spec.tta_horizon + 1, spec.tta_step, dtype=np.float64)
-    xs = pos[:, 0][None, :] + vel[:, 0][None, :] * ts[:, None]
-    ys = pos[:, 1][None, :] + vel[:, 1][None, :] * ts[:, None]
-    hot = (np.abs(ys - py) <= spec.tta_band) & (xs >= -reach) & \
-          (xs <= PLAYFIELD_WIDTH + reach)
-    if not np.any(hot):
-        return np.clip(tta / spec.tta_horizon, 0.0, 1.0)
-    first = np.argmax(hot, axis=0)              # 每颗弹首次进入带宽的时刻下标
-    valid = hot.any(axis=0)
-    if np.any(valid):
-        t_first = ts[first[valid]]
-        x_first = xs[first[valid], np.flatnonzero(valid)]
-        lo = np.searchsorted(centers, x_first - reach, side="left")
-        hi = np.searchsorted(centers, x_first + reach, side="right")
-        for i in range(t_first.shape[0]):
-            if hi[i] > lo[i]:
-                np.minimum(tta[lo[i]:hi[i]], t_first[i], out=tta[lo[i]:hi[i]])
-    return np.clip(tta / spec.tta_horizon, 0.0, 1.0)
+    t1, _t2 = _arrival_times(py, pos, vel, spec)
+    return np.clip(t1 / float(max(1, spec.tta_horizon)), 0.0, 1.0)
 
 
 def _column_centers(spec: GapSpec) -> np.ndarray:
@@ -259,18 +301,25 @@ def gap_observation_dim(spec: GapSpec) -> int:
 
 
 class GapObservation:
-    """把 :class:`GameState` 编码成"未来占用栅格 + 几何缺口"向量。"""
+    """把 :class:`GameState` 编码成"未来占用栅格 + 几何缺口"向量。
+
+    每次调用**都返回一块新数组** (除非显式传 ``out``)。
+
+    这里曾经复用内部缓冲区, 结果 ``rollout`` 里 ``obs_list.append(obs)`` 拿到的是同一个
+    对象 —— 整条轨迹堆叠出来全是最后一帧的观测。BC 因为显式 ``.copy()`` 躲过了,
+    RL 却一直在"用终局状态重复 N 次"更新策略, 这足以单独解释"RL 一微调就崩"。
+    亚毫秒的分配换一个不会静默出错的契约, 值得。
+    """
 
     def __init__(self, spec: GapSpec | None = None) -> None:
         self.spec = spec or GapSpec()
         self.dim = gap_observation_dim(self.spec)
-        self._buf = np.empty(self.dim, dtype=np.float64)
 
     # ------------------------------------------------------------------
     def __call__(self, state: GameState, prev_action: int = -1,
                  out: np.ndarray | None = None) -> np.ndarray:
         spec = self.spec
-        vec = self._buf if out is None else out
+        vec = np.empty(self.dim, dtype=np.float64) if out is None else out
         px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
         py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
         pos, vel = _bullets(state)
@@ -313,6 +362,32 @@ class GapObservation:
             "use_geo": s.use_geo,
             "use_clearance": s.use_clearance,
         }
+
+
+def _column_index(x: float, spec: GapSpec) -> int:
+    """横坐标 -> 车道下标 (与 :func:`_column_centers` 同一套切分)。"""
+    cell = float(PLAYFIELD_WIDTH) / max(1, spec.tta_cols)
+    return int(min(spec.tta_cols - 1, max(0, x / cell)))
+
+
+def lane_safety(state: GameState, spec: GapSpec | None = None) -> float:
+    """自机**当前所在车道**的安全余量, 归一化到 [0, 1] (1 = 很久以后才被威胁)。
+
+    这是纯测量量 ("我站的地方还撑多久"), 不含"该往哪走"。作为**势函数**做奖励塑形
+    ``r += β·(φ' − φ)``, 既不改变最优策略, 又给了"站着不动"一个密集的负梯度。
+
+    注意这里必须按**自机所在车道**取值。之前实验里写成 ``profile[tta_cols // 2]``,
+    那是场地正中间 (x=192) 的车道, 不是自机 —— 于是塑形项一直在奖励"回到屏幕中心",
+    和"别贴墙角"的半条规矩正好打架。
+    """
+    spec = spec or GapSpec()
+    pos, vel = _bullets(state)
+    py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+    px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+    profile = _tta_profile(py, pos, vel, spec)
+    if profile.size == 0:
+        return 0.0
+    return float(profile[_column_index(px, spec)])
 
 
 @dataclass

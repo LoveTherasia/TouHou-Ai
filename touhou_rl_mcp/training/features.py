@@ -8,7 +8,16 @@ RL 智能体的输入。设计原则:
   * 维度固定 (不足补 0 并给 valid=0), 方便接 MLP / SB3。
 
 真实后端必须有有效自机和实体观测，否则明确报错，不再静默填零训练。
-敌人位置由状态接口提供；当前兼容的 74 维策略仅编码敌人数量。
+敌人位置由状态接口提供；74 维策略只编码敌人数量。
+
+三种观测口径 (都由 ``config`` 决定, 训练器与所有工具统一走
+:func:`encode_observation`, 不要各自手拼参数):
+
+* ``use_gap=True``  —— 未来占用栅格 + 几何缺口剖面
+  (:mod:`~touhou_rl_mcp.training.occupancy`)。密集弹幕下唯一能让策略
+  "提前横向占位"的表示, 需要弹速。
+* ``use_grid=True`` —— 以自机为中心的危险图栅格 (静态, 不推演未来)。
+* 默认 —— 最近 ``k_bullets`` 颗弹的 (dx, dy, dist, valid) 一维向量。
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ import numpy as np
 
 from ..types import PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, GameState
 from ..observation import require_entities
+from .occupancy import GapObservation, GapSpec, gap_observation_dim
 
 #: 每个弹幕占的特征数: (dx, dy, 距离, 是否有效)
 BULLET_FEATURE_DIM = 4
@@ -421,14 +431,43 @@ def encode_state_grid(
 
 # ---------------------------------------------------------------------------
 # 统一入口: 训练器/评估脚本只需调用下面两个函数, 就能在
-#   * "最近 K 颗弹的一维向量" (旧)  与
-#   * "危险图栅格" (新, config.use_grid=True)
+#   * "最近 K 颗弹的一维向量" (旧)
+#   * "危险图栅格" (config.use_grid=True)
+#   * "未来占用栅格 + 几何缺口" (config.use_gap=True)
 # 之间切换, 而不用改任何训练逻辑。
 # ---------------------------------------------------------------------------
 
 
+def gap_spec_from(config: Any) -> GapSpec:
+    """按 ``TrainConfig`` 的缺口开关构造 :class:`GapSpec`。
+
+    这些开关会进 ``policy.json`` 的 ``config`` 段, 所以离线评估/真机播放能自动
+    还原出**训练时**的编码方式 —— 编码不一致是这类实验最隐蔽的坑。
+    """
+    return GapSpec(
+        use_grid=bool(getattr(config, "gap_grid", True)),
+        use_geo=bool(getattr(config, "gap_geo", True)),
+        use_clearance=bool(getattr(config, "gap_clearance", True)),
+        use_prev_action=bool(getattr(config, "gap_prev_action", True)),
+    )
+
+
+#: 缺口编码器缓存: ``GapObservation`` 无状态 (每次返回新数组), 按 spec 复用即可
+_GAP_ENCODERS: dict[GapSpec, GapObservation] = {}
+
+
+def gap_encoder(config: Any) -> GapObservation:
+    spec = gap_spec_from(config)
+    encoder = _GAP_ENCODERS.get(spec)
+    if encoder is None:
+        encoder = _GAP_ENCODERS[spec] = GapObservation(spec)
+    return encoder
+
+
 def observation_dim(config: Any) -> int:
-    """按 :class:`TrainConfig` 算出观测维度 (自动区分危险图 / 最近K弹)。"""
+    """按 :class:`TrainConfig` 算出观测维度 (缺口 / 危险图 / 最近K弹三选一)。"""
+    if getattr(config, "use_gap", False):
+        return gap_observation_dim(gap_spec_from(config))
     if getattr(config, "use_grid", False):
         size = getattr(config, "grid_size", GRID_DEFAULT_SIZE)
         span = getattr(config, "grid_span", GRID_DEFAULT_SPAN)
@@ -445,10 +484,10 @@ class ObservationEncoder:
 
     工具 (demo / 真机播放 / 评估) 只要从保存的 ``policy_*.json`` 里读出 config,
     就能自动得到正确的编码方式 —— 不用再手写一堆 ``use_boss=...`` 参数,
-    也不会在"危险图策略"上错用旧特征。::
+    也不会在"缺口策略"上错用旧特征。::
 
         enc = ObservationEncoder.from_meta(meta)   # meta = json["config"]
-        obs = enc(state)                           # -> np.ndarray
+        obs = enc(state, prev_action=3)            # -> np.ndarray
         assert policy.obs_dim == enc.dim
     """
 
@@ -457,7 +496,9 @@ class ObservationEncoder:
                  grid_scales: str = "",
                  k_bullets: int = 16, bullet_velocity: bool = False, k_enemies: int = 0,
                  use_invincible: bool = False, use_boss: bool = False,
-                 use_danger_grad: bool = False) -> None:
+                 use_danger_grad: bool = False,
+                 use_gap: bool = False, gap_grid: bool = True, gap_geo: bool = True,
+                 gap_clearance: bool = True, gap_prev_action: bool = True) -> None:
         self.use_grid = bool(use_grid)
         self.grid_size = int(grid_size)
         self.grid_span = float(grid_span)
@@ -468,6 +509,11 @@ class ObservationEncoder:
         self.use_invincible = bool(use_invincible)
         self.use_boss = bool(use_boss)
         self.use_danger_grad = bool(use_danger_grad)
+        self.use_gap = bool(use_gap)
+        self.gap_grid = bool(gap_grid)
+        self.gap_geo = bool(gap_geo)
+        self.gap_clearance = bool(gap_clearance)
+        self.gap_prev_action = bool(gap_prev_action)
 
     @classmethod
     def from_meta(cls, meta: dict | None = None) -> "ObservationEncoder":
@@ -483,6 +529,11 @@ class ObservationEncoder:
             use_invincible=bool(meta.get("use_invincible", False)),
             use_boss=bool(meta.get("use_boss", False)),
             use_danger_grad=bool(meta.get("use_danger_grad", False)),
+            use_gap=bool(meta.get("use_gap", False)),
+            gap_grid=bool(meta.get("gap_grid", True)),
+            gap_geo=bool(meta.get("gap_geo", True)),
+            gap_clearance=bool(meta.get("gap_clearance", True)),
+            gap_prev_action=bool(meta.get("gap_prev_action", True)),
         )
 
     @property
@@ -491,13 +542,22 @@ class ObservationEncoder:
                                 default_span=self.grid_span)
 
     @property
+    def gap_spec(self) -> GapSpec:
+        return gap_spec_from(self)
+
+    @property
     def dim(self) -> int:
         return observation_dim(self)
 
-    def __call__(self, state: GameState, out: np.ndarray | None = None) -> np.ndarray:
-        return encode_observation(state, self, out=out)
+    def __call__(self, state: GameState, out: np.ndarray | None = None,
+                 prev_action: int = -1) -> np.ndarray:
+        return encode_observation(state, self, out=out, prev_action=prev_action)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
+        if self.use_gap:
+            spec = self.gap_spec
+            return (f"ObservationEncoder(gap grid={spec.use_grid} geo={spec.use_geo} "
+                    f"clearance={spec.use_clearance} dim={self.dim})")
         if self.use_grid:
             scales = ",".join(f"{s}x{s}/±{sp:g}" for s, sp in self.scales)
             return (f"ObservationEncoder(grid[{scales}] vel={self.bullet_velocity} "
@@ -507,8 +567,15 @@ class ObservationEncoder:
 
 
 def encode_observation(state: GameState, config: Any,
-                       out: np.ndarray | None = None) -> np.ndarray:
-    """按 :class:`TrainConfig` 编码一帧 (危险图或最近K弹)。"""
+                       out: np.ndarray | None = None,
+                       prev_action: int = -1) -> np.ndarray:
+    """按 :class:`TrainConfig` 编码一帧 (缺口 / 危险图 / 最近K弹)。
+
+    ``prev_action`` 只对 ``use_gap`` 有效 (方向下标 0~8, -1=未知), 用于把"上一动作"
+    的 one-hot 拼进观测 —— 宏动作有 6 帧承诺, 策略必须知道自己在往哪走。
+    """
+    if getattr(config, "use_gap", False):
+        return gap_encoder(config)(state, prev_action=prev_action, out=out)
     if getattr(config, "use_grid", False):
         return encode_state_grid(
             state,

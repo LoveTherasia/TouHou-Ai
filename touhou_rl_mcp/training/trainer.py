@@ -26,7 +26,7 @@ import numpy as np
 
 from ..config import runtime_dir
 from ..types import GameState
-from .features import encode_observation, feature_dim, observation_dim
+from .features import encode_observation, feature_dim, gap_spec_from, observation_dim
 from .journal import Journal
 from .policy import MLPPolicy
 
@@ -73,9 +73,32 @@ def build_action_table(*, use_focus: bool = False, use_bomb: bool = False) -> li
     return table
 
 
+def apply_scenario(env: Any, scenario: dict[str, float] | None) -> None:
+    """把基准场景参数写进 mock 的弹型对象 (例如 ``wall_gate`` 的缺口宽度/漂移)。
+
+    为什么需要它: ``MockBackend.reset`` 每次都会**重建** ``MockGame``, 于是弹型对象
+    也是新的 —— 训练器如果在外面 setattr 一次, 第二局就失效了。所以场景必须跟着
+    ``TrainConfig`` 走, 在每次 reset 之后重新应用。
+
+    值按**属性原本的类型**强制转换 (55 -> 95.0 会变成 95), 免得 ``frame % interval``
+    拿到浮点数。
+    """
+    if not scenario:
+        return
+    backend = getattr(env, "backend", None)
+    pattern = getattr(getattr(backend, "game", None), "pattern", None)
+    if pattern is None:
+        raise ValueError("scenario 需要 danmaku_pattern 弹型 (当前环境没有)")
+    for key, value in scenario.items():
+        if not hasattr(pattern, key):
+            raise KeyError(f"弹型 {type(pattern).__name__} 没有参数 {key!r}")
+        current = getattr(pattern, key)
+        setattr(pattern, key, type(current)(value))
+
+
 @dataclass
 class TrainConfig:
-    """训练超参 —— 全部可以通过 MCP 在线修改."""
+    """训练超参 —— 全部可以通过 MCP 在线修改。"""
 
     algorithm: str = "ppo"  # "ppo" | "reinforce_baseline"
     episodes: int = 300  # 0 = 无限局
@@ -103,8 +126,26 @@ class TrainConfig:
     use_boss: bool = True
     #: 观测是否包含"危险梯度" (最近弹幕斥力合成) —— 让反应式躲避更易被策略表示
     use_danger_grad: bool = False
-    #: 观测改用"危险图" (以自机为中心的弹幕位置栅格) 而不是"最近 K 颗弹的一维向量"
+    #: 观测改用"危险图" (以自机为中心) 而不是"最近 K 颗弹的一维向量"
     use_grid: bool = False
+    #: 观测改用"未来占用栅格 + 几何缺口" (见 training/occupancy.py)。
+    #: 这是密集弹幕下唯一能让策略提前横向占位的表示; 需要弹速 (mock 直接提供)。
+    use_gap: bool = False
+    #: use_gap 时拼接哪几块 (时间分层栅格 / TTA 剖面 / 8 方向安全余量)
+    gap_grid: bool = True
+    gap_geo: bool = True
+    gap_clearance: bool = True
+    #: use_gap 时把上一动作 one-hot 拼进观测 (宏动作有承诺期, 策略要知道自己的动量)
+    gap_prev_action: bool = True
+    #: 缺口老师的标签口径: now / reach / future / slack (见 training/gap_label.py)
+    gap_label: str = "reach"
+    #: 基准场景参数 (写进 mock 的弹型对象), 例如 wall_gate 的
+    #: ``{"interval": 95, "gap_width": 46, "speed": 2.05, "gap_drift": 0.34}``
+    scenario: dict[str, float] = field(default_factory=dict)
+    #: 每局在这些区间里**重新采样**的场景参数 (domain randomization)。
+    #: 例如 ``{"gap_phase": [0.0, 1.0]}`` —— 不加它, wall_gate 每局的缺口相位都一样,
+    #: 训练集退化成"同一个局面重复 N 次", 策略只会背下那一个相位。
+    scenario_random: dict[str, list[float]] = field(default_factory=dict)
     #: 危险图边长 (格数); 观测维度 = grid_size^2 * (1 或 3) + 全局特征
     grid_size: int = 16
     #: 危险图半径 (像素): 覆盖自机周围 ±grid_span
@@ -370,6 +411,11 @@ class Trainer:
             or new_config.use_boss != self.config.use_boss
             or new_config.use_danger_grad != self.config.use_danger_grad
             or new_config.use_grid != self.config.use_grid
+            or new_config.use_gap != self.config.use_gap
+            or new_config.gap_grid != self.config.gap_grid
+            or new_config.gap_geo != self.config.gap_geo
+            or new_config.gap_clearance != self.config.gap_clearance
+            or new_config.gap_prev_action != self.config.gap_prev_action
             or new_config.grid_size != self.config.grid_size
             or new_config.grid_span != self.config.grid_span
             or new_config.grid_scales != self.config.grid_scales
@@ -458,10 +504,16 @@ class Trainer:
             result = self.env.reset(seed=config.seed + index, difficulty=config.difficulty,
                                     character=character, shot=shot,
                                     start_stage=config.start_stage)
+            apply_scenario(self.env, config.scenario)
+            if config.scenario_random:
+                apply_scenario(self.env, {
+                    key: float(self._rng.uniform(float(bounds[0]), float(bounds[1])))
+                    for key, bounds in config.scenario_random.items() if len(bounds) >= 2
+                })
             state: GameState = result.state
             if getattr(self.env, "backend_name", None) == "memory" and (state.char_main, state.char_sub) != (character, shot):
                 raise ValueError(f"选机失败: 请求 {(character, shot)}, 实际 {(state.char_main, state.char_sub)}")
-            obs = encode_observation(state, config)
+            obs = encode_observation(state, config, prev_action=-1)
 
         observations: list[np.ndarray] = []
         actions: list[int] = []
@@ -490,9 +542,17 @@ class Trainer:
                 from .rule_teacher import RuleTeacher
 
                 guard = RuleTeacher()
+            elif teacher in {"gap", "gap_dagger"}:
+                from .gap_teacher import GapTeacher
+
+                guard = GapTeacher(gap_spec_from(config), mode=config.gap_label)
         # DAgger: 由**策略自己**驱动游戏(带 beta 概率混入老师动作保证覆盖),
         # 但每步都用老师对其**实际访问到的状态**打标签 -> 修正 BC 的分布漂移。
-        dagger_beta = float(getattr(config, "dagger_beta", 0.2)) if teacher == "dagger" else 1.0
+        # 纯模仿 (guard/rule/gap) 时 beta=1, 完全由老师接管。
+        dagger_beta = (float(getattr(config, "dagger_beta", 0.2))
+                       if teacher in {"dagger", "rule_dagger", "gap_dagger"} else 1.0)
+        # 记录"上一动作"的方向下标; 缺口观测要靠它表达宏动作的承诺方向
+        prev_dir = -1
 
         # max_steps <= 0 表示不限长; 一局只在真正 game over / clear 时结束
         step_limit = int(config.max_steps) if config.max_steps and config.max_steps > 0 else None
@@ -599,7 +659,10 @@ class Trainer:
                 record.truncated = bool(step.truncated)
                 break
 
-            obs = encode_observation(state, config)
+            # 缺口观测需要"上一动作": 动作表是 [9 快速] + [9 低速] + [... 炸弹],
+            # 取模 9 就得到方向下标, 与 occupancy.DIRECTIONS 同序。
+            prev_dir = exec_action % len(DIRECTIONS)
+            obs = encode_observation(state, config, prev_action=prev_dir)
 
         if step_limit is not None and record.steps >= step_limit and not (record.cleared or record.game_over):
             record.truncated = True
@@ -630,7 +693,7 @@ class Trainer:
             return record, None
         terminal = bool(record.cleared or record.game_over)
         try:
-            final_obs = encode_observation(state, config)
+            final_obs = encode_observation(state, config, prev_action=prev_dir)
             if terminal:
                 bootstrap = 0.0
             else:
@@ -717,6 +780,8 @@ class Trainer:
             return stats
 
         gamma = self.config.gamma
+        # 与 _update_ppo 同理: 价值回归的平方损失会冲垮共享隐层, 先按整批回报的量级缩放
+        scale = self._value_scale(batch)
         all_obs: list[np.ndarray] = []
         all_actions: list[int] = []
         all_advantages: list[np.ndarray] = []
@@ -735,7 +800,7 @@ class Trainer:
             all_obs.extend(traj.observations)
             all_actions.extend(traj.actions)
             all_advantages.append(advantages)
-            all_returns.extend(returns.tolist())
+            all_returns.extend((returns / scale).tolist())
 
         if not all_obs:
             return {}
@@ -759,6 +824,14 @@ class Trainer:
         """PPO: GAE 优势 + clipped surrogate, 可多 epoch / mini-batch 更新。"""
         gamma = float(self.config.gamma)
         lam = float(getattr(self.config, "gae_lambda", 0.95))
+        # 先用整批回报的量级把奖励/价值统一缩放, 再做 GAE 与价值回归。
+        #
+        # 为什么必须缩放: 价值回归的平方损失作用在**共享隐层**上, 而回报量级是几百到
+        # 上千 (存活奖励 1/步 × 400 步)。不缩放时 value_err ~ 1e3, 平方损失 ~ 1e6,
+        # 一项就盖过被归一化过的策略梯度 —— 实测 value_loss 4618 / grad_norm 2626,
+        # 熵在两次更新内掉到 0, DAgger 练出来的 2400 帧策略被打回 624 (= 不动)。
+        # 缩放对 GAE 是线性的 (整批同一个 scale), 归一化后的优势完全不变。
+        scale = self._value_scale(batch)
         all_obs: list[np.ndarray] = []
         all_actions: list[int] = []
         all_logp: list[float] = []
@@ -767,7 +840,7 @@ class Trainer:
         for traj in batch:
             if not traj.rewards:
                 continue
-            adv, ret = self._gae(traj, gamma, lam)
+            adv, ret = self._gae(traj, gamma, lam, scale=scale)
             all_obs.extend(traj.observations)
             all_actions.extend(traj.actions)
             all_logp.extend(traj.logps)
@@ -781,7 +854,7 @@ class Trainer:
             if std > 1e-6:
                 adv = (adv - float(adv.mean())) / (std + 1e-8)
         with self.policy_lock:
-            return self.policy.update_ppo(
+            stats = self.policy.update_ppo(
                 np.stack(all_obs),
                 np.asarray(all_actions, dtype=np.int64),
                 np.asarray(all_logp, dtype=np.float64),
@@ -794,15 +867,24 @@ class Trainer:
                 entropy_coef=float(self.config.entropy_coef),
                 target_kl=float(getattr(self.config, "target_kl", 0.05)),
             )
+        stats["value_scale"] = round(scale, 4)
+        return stats
 
     @staticmethod
-    def _gae(traj: Trajectory, gamma: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
-        rewards = np.asarray(traj.rewards, dtype=np.float64)
-        values = np.asarray(traj.values, dtype=np.float64)
+    def _value_scale(batch: list[Trajectory]) -> float:
+        """整批回报的量级 (≈ 单局回报绝对值), 用来把价值回归压到 O(1)。"""
+        totals = [abs(float(np.sum(tra.rewards))) for tra in batch if tra.rewards]
+        return max(1.0, float(np.mean(totals))) if totals else 1.0
+
+    @staticmethod
+    def _gae(traj: Trajectory, gamma: float, lam: float,
+             *, scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+        rewards = np.asarray(traj.rewards, dtype=np.float64) / scale
+        values = np.asarray(traj.values, dtype=np.float64) / scale
         dones = traj.dones if len(traj.dones) == len(rewards) else [False] * len(rewards)
         n = len(rewards)
         adv = np.zeros(n, dtype=np.float64)
-        next_value = float(traj.bootstrap_value)
+        next_value = float(traj.bootstrap_value) / scale
         last = 0.0
         for t in range(n - 1, -1, -1):
             nonterminal = 0.0 if dones[t] else 1.0

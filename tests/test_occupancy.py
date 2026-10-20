@@ -12,7 +12,7 @@ import unittest
 import numpy as np
 
 from touhou_rl_mcp.training.occupancy import (
-    GapObservation, GapSpec, _bullets, _column_centers, _tta_profile,
+    GapObservation, GapSpec, _bullets, _column_centers, _tta_profile, lane_safety,
 )
 from touhou_rl_mcp.types import GameState
 
@@ -111,6 +111,36 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(enc.dim, 7 + 9)               # 7 维全局 + 9 维 one-hot
         self.assertEqual(float(obs[7 + 5]), 1.0)
         self.assertAlmostEqual(float(obs[7:].sum()), 1.0, places=6)
+
+    def test_each_call_returns_independent_buffer(self) -> None:
+        """回归: 曾经复用内部缓冲区, 于是轨迹里每条观测都指向最后一帧。
+
+        BC 因为显式 copy 躲过了, RL 却一直在"用终局状态重复 N 次"更新 —— 这足以
+        单独解释"一微调就崩"。契约: 不传 out 就必须拿到独立数组。
+        """
+        enc = GapObservation(GapSpec(use_grid=False))
+        first = enc(_wall_state(60.0, 416.0, hole_x=60.0, hole_width=60.0, wall_y=300.0))
+        snapshot = first.copy()
+        second = enc(_wall_state(340.0, 416.0, hole_x=340.0, hole_width=60.0, wall_y=300.0))
+        self.assertIsNot(first, second)
+        self.assertTrue(np.allclose(first, snapshot), "第二次编码改写了第一次的结果")
+        self.assertFalse(np.allclose(first, second))
+
+
+class LaneSafetyTest(unittest.TestCase):
+    """塑形用的 φ 必须取**自机所在车道**, 不是场地正中间那条。"""
+
+    def test_uses_player_column_not_field_centre(self) -> None:
+        # 缺口在正中间 (192), 自机站在最左边 —— 那里马上就要被墙盖住
+        state = _wall_state(24.0, 416.0, hole_x=192.0, hole_width=46.0, wall_y=340.0)
+        phi = lane_safety(state, GapSpec())
+        middle = _tta_profile(416.0, *_bullets(state), GapSpec())[16]
+        self.assertLess(phi, 0.2, "贴在墙上却报告很安全 = 取错了车道")
+        self.assertGreater(middle, 0.9, "缺口车道本身应该是安全的")
+
+    def test_standing_in_the_gap_is_safe(self) -> None:
+        state = _wall_state(192.0, 416.0, hole_x=192.0, hole_width=46.0, wall_y=340.0)
+        self.assertGreater(lane_safety(state, GapSpec()), 0.9)
 
 
 if __name__ == "__main__":

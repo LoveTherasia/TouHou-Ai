@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -39,18 +38,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from touhou_rl_mcp.config import Config, runtime_dir   # noqa: E402
 from touhou_rl_mcp.env import TouhouEnv            # noqa: E402
 from touhou_rl_mcp.training.journal import Journal  # noqa: E402
-from touhou_rl_mcp.types import PLAYFIELD_WIDTH    # noqa: E402
 from touhou_rl_mcp.training.occupancy import (     # noqa: E402
-    DIRECTIONS, PLAYER_SPEED, GapObservation, GapSpec,
-    _best_column, _bullets, _column_centers, _tta_profile,
+    GapObservation, GapSpec, _best_column, _bullets, _column_centers,
+    _tta_profile, lane_safety,
+)
+from touhou_rl_mcp.training.gap_label import (     # noqa: E402
+    COMMIT_FRAMES, LABEL_MODES, MACRO_ACTIONS, gap_label,
 )
 
 #: 动作表: 8 方向 + 原地, 每个动作承诺 6 帧 (60Hz 下的 0.1 秒)
-ACTIONS: tuple[str, ...] = (
-    "shoot", "up+shoot", "down+shoot", "left+shoot", "right+shoot",
-    "up_left+shoot", "up_right+shoot", "down_left+shoot", "down_right+shoot",
-)
-MACRO_FRAMES = 6
+ACTIONS: tuple[str, ...] = MACRO_ACTIONS
+MACRO_FRAMES = COMMIT_FRAMES
 
 #: 训练场景 (v1: 初版缺口墙, 泛化上限 1800 帧已经被打满)
 TRAIN_V1: dict[str, float] = dict(
@@ -74,13 +72,24 @@ HELDOUT_V2: tuple[dict[str, float], ...] = (
     dict(interval=102.0, gap_width=44.0, speed=1.95, gap_drift=-0.36, gap_phase=0.13),
 )
 
+#: v3: 规则基线**打不满**的难度 (interval 75 / 漂移 0.9 = 缺口每堵墙横移 324px,
+#: 赶路就要 74 帧 ≈ 一个间隔)。标定: "缺口跟随" 在这些场景上只能活 ~1800 帧,
+#: 所以 2400 的时限不再是天花板, 标签/奖励的差别才有可能显出来。
+#: 本轮**没有**在 v3 上训练, 只做了标定 —— 留给下一轮用。
+TRAIN_V3: dict[str, float] = dict(
+    interval=75.0, gap_width=44.0, speed=2.05, gap_drift=0.90, gap_phase=0.0,
+)
+HELDOUT_V3: tuple[dict[str, float], ...] = (
+    dict(interval=75.0, gap_width=44.0, speed=2.05, gap_drift=0.90, gap_phase=0.12),
+    dict(interval=72.0, gap_width=44.0, speed=2.15, gap_drift=-0.88, gap_phase=0.41),
+    dict(interval=78.0, gap_width=42.0, speed=2.00, gap_drift=0.94, gap_phase=0.67),
+)
+
 BENCHMARKS: dict[str, tuple[dict[str, float], tuple[dict[str, float], ...]]] = {
     "v1": (TRAIN_V1, HELDOUT_V1),
     "v2": (TRAIN_V2, HELDOUT_V2),
+    "v3": (TRAIN_V3, HELDOUT_V3),
 }
-
-#: 缺口的判定半径 (自机 2 + 弹 3), 用来把"可选列"折成"真正站得住的列"
-REACH_PAD = 6.0
 
 
 # ----------------------------------------------------------------------
@@ -238,20 +247,9 @@ class Policy:
 
 
 # ----------------------------------------------------------------------
-def lane_safety(state, spec: GapSpec) -> float:
-    """自机**当前所在列**的安全余量 (TTA 剖面的中点)。
-
-    剖面是以自机为中心算的, 所以自机永远在中间那一列。这个量回答的是
-    "我站的地方还安全吗", 是纯粹由占用栅格导出的测量, 不包含"该往哪走"。
-    把它当**势函数**做奖励塑形 (r += β·(φ' - φ)), 可以在不改变最优策略的前提下
-    给出密集梯度 —— 没有它, "站着不动"就是一个很难跳出的局部最优。
-    """
-    pos, vel = _bullets(state)
-    profile = _tta_profile(state.player_y, pos, vel, spec)
-    mid = spec.tta_cols // 2
-    return float(profile[mid])
-
-
+#: 势函数塑形用的 φ 直接取自 training.occupancy.lane_safety —— 早期这里自己算过一份,
+#: 取的是 ``profile[tta_cols // 2]``(场地正中间那条车道), 等于在奖励"回到屏幕中心",
+#: 与"别贴边"的初衷正好拧着。现在统一走包里那一份 (按自机所在车道取值)。
 def rollout(env: TouhouEnv, enc: GapObservation, policy: Policy | None,
             rng: np.random.Generator, *, seed: int,
             scenario: dict[str, float], max_frames: int,
@@ -389,117 +387,6 @@ def spec_for_arm(arm: str) -> GapSpec:
     return GapSpec(use_grid=True, use_geo=True, use_clearance=True)
 
 
-def _tta_frames(state, spec: GapSpec) -> np.ndarray:
-    """把归一化剖面换算回"每列还有多少帧被占" (帧)。"""
-    pos, vel = _bullets(state)
-    prof = _tta_profile(state.player_y, pos, vel, spec)
-    return prof * float(spec.tta_horizon)
-
-
-def _reach_target(state, spec: GapSpec) -> float | None:
-    """考虑"能不能及时赶到"之后, 值得去的目标列中心 (绝对 x)。
-
-    原来的标签只问"现在哪一列最空", 于是会指着一列 200px 外、但 30 帧后就要被封死
-    的缝。这里改成 ``可用余量 - 赶路时间``: 站得住且来得及的列才值得去, 已经站对了
-    就不动 (距离代价为 0, 天然占优)。
-    """
-    tta = _tta_frames(state, spec)
-    if not np.any(tta > 0):
-        return None
-    centers = _column_centers(spec)
-    travel = np.abs(centers - state.player_x) / PLAYER_SPEED
-    slack = tta - travel                      # 赶到之后还剩多少帧安全余量
-    # 判定半径之内的列差一个像素没有区别, 用 pad 把"站得住"的列并成一档
-    padded = np.floor(slack / REACH_PAD) * REACH_PAD
-    best = float(padded.max())
-    tied = np.flatnonzero(padded >= best - 1e-9)
-    k = int(tied[np.argmin(np.abs(centers[tied] - state.player_x))])
-    return float(centers[k])
-
-
-def _macro_x(x: float, action: int) -> float:
-    """朝某方向承诺 ``MACRO_FRAMES`` 帧后的横坐标 (斜向按 45° 归一化)。"""
-    ux, uy = DIRECTIONS[action]
-    norm = float(np.hypot(ux, uy))
-    dx = (ux / norm) if norm else 0.0
-    return min(PLAYFIELD_WIDTH - 8.0, max(8.0, x + dx * PLAYER_SPEED * MACRO_FRAMES))
-
-
-def gap_label(state, spec: GapSpec, mode: str = "future") -> int:
-    """弱监督标签: 只回答"往哪个方向走", 不回答"该不该躲"。
-
-    三种口径, 依次递进 (都只用几何测量, 不含手写代价函数):
-
-    ``now``
-        当前剖面里最空的那一列。**问题**: 它不管自机来不来得及, 而且整片安全时
-        argmax 会退化成某一个固定列 (已修成"挑离自机最近的列")。
-    ``reach``
-        在 ``now`` 上加入可达性: 目标列必须"赶过去以后还有余量"。已经站对时标签是
-        原地, 不会为了 3 个像素的偏差来回摆。
-    ``future``
-        承诺语义: 沿同一方向推 4 步 (24 帧) 取最好的时刻, 直接输出动作。详见
-        :func:`_future_label`。
-    """
-    if mode == "future":
-        return _future_label(state, spec)
-    target = _reach_target(state, spec)
-    if target is None:
-        return 0
-    delta = target - state.player_x
-    if abs(delta) < 10.0:
-        return 0
-    if mode == "reach":
-        return 4 if delta > 0 else 3
-    # now: 只取当前最空的一列, 不考虑赶路
-    tta = _tta_frames(state, spec)
-    if not np.any(tta > 0):
-        return 0
-    k = _best_column(tta / float(spec.tta_horizon), state.player_x, spec)
-    delta = float(_column_centers(spec)[k]) - state.player_x
-    if abs(delta) < 10.0:
-        return 0
-    return 4 if delta > 0 else 3
-
-
-def _future_label(state, spec: GapSpec, lookahead: int = 4) -> int:
-    """前瞻标签: 朝某个方向连续走 ``lookahead`` 个宏动作, 取这条直线上最好的时刻。
-
-    ``now`` / ``reach`` 都只看"此刻哪条车道最空", 于是缺口在 100px 外时它给不出
-    "现在就该往那边挪"的信号 —— 而每步只能走 26px, 等到"此刻最空的那条"变成眼前
-    的车道时往往已经来不及。
-
-    这里换成**承诺语义**: 沿同一方向推 4 步 (24 帧, ~105px), 看看这条路上最好的时刻
-    能有多安全。它和策略的动作空间同构, 也不会左右摇摆。
-
-    两个实测过的坑 (都写在这里, 免得再踩):
-    * 只算一步落点 -> 所有方向都不如原地 (还要付 6 帧赶路), 标签退化成"永远别动";
-    * 把纵向位移按弹速折算成"少了几帧余量" -> 下移看起来永远划算, 标签退化成
-      "一直按着下" (71% 的样本)。在只有存活奖励的任务里, 苟活永远是最省事的最优。
-    """
-    tta = _tta_frames(state, spec)
-    if not np.any(tta > 0):
-        return 0
-    cols = spec.tta_cols
-    cell = float(PLAYFIELD_WIDTH) / cols
-
-    def column(x: float) -> int:
-        return int(min(cols - 1, max(0, x / cell)))
-
-    best: tuple[tuple[float, float], int] | None = None
-    for action in range(len(DIRECTIONS)):
-        x = state.player_x
-        score = -1e18
-        for step in range(1, lookahead + 1):
-            x = _macro_x(x, action)
-            score = max(score, float(tta[column(x)]) - step * MACRO_FRAMES)
-        # 量化到 REACH_PAD, 避免"差 1 帧"就换动作的抖动; 并列时位移小的胜出
-        quantised = math.floor(score / REACH_PAD) * REACH_PAD
-        key = (-quantised, abs(_macro_x(state.player_x, action) - state.player_x))
-        if best is None or key < best[0]:
-            best = (key, action)
-    return 0 if best is None else best[1]
-
-
 def collect_labels(env: TouhouEnv, enc: GapObservation, rng: np.random.Generator,
                    *, episodes: int, max_frames: int,
                    scenario: dict[str, float],
@@ -600,8 +487,9 @@ def main() -> int:
     ap.add_argument("--arm", choices=("geo", "grid", "both"), default="both")
     ap.add_argument("--bench", choices=tuple(BENCHMARKS), default="v2",
                     help="基准版本: v1=初版缺口墙, v2=更窄更快、漂移更大的新基准")
-    ap.add_argument("--label", choices=("now", "reach", "future"), default="reach",
-                    help="弱监督标签口径: now=当前最空; reach=考虑赶路时间; future=两步 maximin")
+    ap.add_argument("--label", choices=LABEL_MODES, default="reach",
+                    help="弱监督标签口径: now=当前最空; reach=考虑赶路时间; "
+                         "future=沿方向推 4 步; slack=两堵墙的 maximin 余量")
     ap.add_argument("--updates", type=int, default=60)
     ap.add_argument("--episodes", type=int, default=16, help="每次更新采集多少局")
     ap.add_argument("--max-frames", type=int, default=2400, help="单局上限帧数")

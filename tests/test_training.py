@@ -127,6 +127,152 @@ class TestTrainer(unittest.TestCase):
         self.assertAlmostEqual(env.reward_model.weights["danger_scale"], 1.5)
 
 
+class TestGapObservationInTrainer(unittest.TestCase):
+    """缺口观测 / 缺口老师 / 基准场景接入 Trainer 的契约。"""
+
+    def test_observation_dim_matches_the_encoder(self) -> None:
+        from touhou_rl_mcp.training.features import (
+            encode_observation, gap_spec_from, observation_dim,
+        )
+        from touhou_rl_mcp.training.occupancy import GapObservation
+        from touhou_rl_mcp.types import GameState
+
+        config = TrainConfig(use_gap=True, use_focus=False)
+        spec = gap_spec_from(config)
+        self.assertEqual(observation_dim(config), GapObservation(spec).dim)
+        state = GameState(
+            frame=100, in_game=True, player_x=192.0, player_y=416.0, lives=2,
+            bullets=[(100.0, 300.0), (280.0, 320.0)],
+            raw={"bullet_velocity": [(0.0, 2.0), (0.0, 2.0)]},
+        )
+        obs = encode_observation(state, config, prev_action=3)
+        self.assertEqual(obs.shape, (observation_dim(config),))
+        self.assertEqual(obs.dtype.name, "float64")
+        self.assertAlmostEqual(float(obs[-9:].sum()), 1.0)   # 上一动作 one-hot
+        self.assertEqual(float(obs[-9:][3]), 1.0)
+
+    def test_gap_arms_change_the_dimension(self) -> None:
+        from touhou_rl_mcp.training.features import observation_dim
+
+        geo = observation_dim(TrainConfig(use_gap=True, gap_grid=False, use_focus=False))
+        both = observation_dim(TrainConfig(use_gap=True, use_focus=False))
+        self.assertGreater(both, geo)
+
+    def test_apply_scenario_writes_pattern_fields(self) -> None:
+        from touhou_rl_mcp.training.trainer import apply_scenario
+
+        env = TouhouEnv(
+            Config({"backend": "mock", "game": "th11", "danmaku_pattern": "wall_gate"}),
+            registry=GameRegistry(),
+        )
+        env.start()
+        self.addCleanup(env.close)
+        env.reset(seed=3)
+        apply_scenario(env, {"gap_width": 46.0, "interval": 95.0, "gap_phase": 0.27})
+        pattern = env.backend.game.pattern
+        self.assertAlmostEqual(pattern.gap_width, 46.0)
+        self.assertEqual(pattern.interval, 95)      # 按声明类型转回 int
+        self.assertAlmostEqual(pattern.gap_phase, 0.27)
+        with self.assertRaises(KeyError):
+            apply_scenario(env, {"nope": 1.0})
+
+    def test_gap_trainer_reaches_an_episode(self) -> None:
+        """教师 + 缺口观测 + 场景参数一起跑一局 (冒烟, 不验证学习效果)。"""
+        from touhou_rl_mcp.training.trainer import apply_scenario
+
+        env = TouhouEnv(
+            Config({"backend": "mock", "game": "th11", "danmaku_pattern": "wall_gate",
+                    "step_frames": 6, "max_episode_frames": 0}),
+            registry=GameRegistry(),
+        )
+        env.start()
+        self.addCleanup(env.close)
+        config = tiny_config(
+            episodes=1, max_steps=12, step_frames=6, use_focus=False,
+            use_gap=True, gap_grid=False, teacher="gap", gap_label="slack",
+            scenario={"interval": 95.0, "gap_width": 46.0},
+            scenario_random={"gap_phase": [0.0, 1.0]},
+        )
+        trainer = Trainer(env, config, env_lock=env.lock)
+        self.assertEqual(trainer.obs_dim, 70)
+        self.assertEqual(len(trainer.action_table), 9)
+
+        trainer.start()
+        deadline = time.time() + 60
+        while len(trainer.episodes) < 1 and trainer.running and time.time() < deadline:
+            time.sleep(0.05)
+        trainer.stop(save=False)
+
+        self.assertIsNone(trainer.error, trainer.error)
+        self.assertEqual(len(trainer.episodes), 1)
+        self.assertEqual(trainer.episodes[0].steps, 12)
+        self.assertAlmostEqual(env.backend.game.pattern.gap_width, 46.0)
+        self.assertTrue(any(k.startswith("shoot") for k in trainer.episodes[0].actions))
+
+
+class TestValueScale(unittest.TestCase):
+    """价值回归必须按整批回报的量级缩放, 否则平方损失会冲垮共享隐层。"""
+
+    def test_gae_is_linear_in_the_scale(self) -> None:
+        import numpy as np
+
+        from touhou_rl_mcp.training.trainer import Trajectory
+
+        traj = Trajectory(
+            observations=[], actions=[], logps=[], values=[10.0] * 20,
+            rewards=[100.0] * 20, dones=[False] * 20, bootstrap_value=10.0,
+        )
+        adv_raw, ret_raw = Trainer._gae(traj, 0.99, 0.95)
+        adv_scaled, ret_scaled = Trainer._gae(traj, 0.99, 0.95, scale=100.0)
+        self.assertTrue(np.allclose(adv_scaled, adv_raw / 100.0))
+        self.assertTrue(np.allclose(ret_scaled, ret_raw / 100.0))
+        # 缩放后价值目标从 O(1e3) 降到 O(10), 平方损失从 1e6 降到 1e2 量级
+        self.assertLess(float(np.abs(ret_scaled).max()),
+                        0.05 * float(np.abs(ret_raw).max()))
+
+    def test_value_scale_uses_the_trajectory_magnitude(self) -> None:
+        from touhou_rl_mcp.training.trainer import Trajectory
+
+        small = Trajectory(observations=[], actions=[], logps=[], values=[0.0],
+                           rewards=[1.0] * 10, dones=[False] * 10)
+        big = Trajectory(observations=[], actions=[], logps=[], values=[0.0],
+                         rewards=[100.0] * 10, dones=[False] * 10)
+        self.assertEqual(Trainer._value_scale([small]), 10.0)
+        self.assertEqual(Trainer._value_scale([big]), 1000.0)
+
+
+class TestRewardProfiles(unittest.TestCase):
+    def test_gap_survive_turns_off_the_repulsion_term(self) -> None:
+        from touhou_rl_mcp.rl.reward import reward_profile
+
+        weights = reward_profile("gap_survive")
+        # 斥力项教的是"离弹越远越好" = 缩墙角, 必须关掉
+        self.assertEqual(weights["danger_scale"], 0.0)
+        # profile 是整份覆盖: 少了整体缩放, 总奖励会恒为 0
+        self.assertEqual(weights["shaping_scale"], 1.0)
+        self.assertGreater(weights["alive_bonus"], 0.0)
+        self.assertGreater(weights["graze_scale"], 0.0)
+        self.assertLess(weights["miss_penalty"], 0.0)
+
+    def test_gap_margin_shaping_is_a_potential(self) -> None:
+        from touhou_rl_mcp.rl.reward import RewardModel, reward_profile
+        from touhou_rl_mcp.types import GameState
+
+        weights = {**reward_profile("gap_survive"), "gap_margin_scale": 2.0}
+        model = RewardModel(weights)
+        before = GameState(frame=10, in_game=True, player_x=192.0, player_y=416.0,
+                           lives=2, bullets=[(192.0, 300.0)],
+                           raw={"bullet_velocity": [(0.0, 2.0)]})
+        after = GameState(frame=16, in_game=True, player_x=48.0, player_y=416.0,
+                          lives=2, bullets=[(192.0, 312.0)],
+                          raw={"bullet_velocity": [(0.0, 2.0)]})
+        first = model.compute(before, before)[1]
+        self.assertNotIn("gap", first)          # 第一帧只建立基线
+        parts = model.compute(before, after)[1]
+        # 从贴墙挪进缺口 -> φ 上升 -> 塑形项为正
+        self.assertGreater(parts.get("gap", 0.0), 0.0)
+
+
 def _params():
     from mcp.client.stdio import StdioServerParameters
 
