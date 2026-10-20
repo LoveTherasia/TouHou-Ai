@@ -12,15 +12,23 @@
 |---|---|
 | `research/gap_rl.py` | 缺口任务最小学习实验：观测对照 / 感知弱监督 / BC 锚，写标准 run 记录 |
 | `research/gap_trainer.py` | 同一批实验走**正式训练链路**（Trainer）：`use_gap` 观测 + 新奖励 + 缺口老师，BC→DAgger→PPO 分阶段 |
+| `research/gap_diagnose.py` | 把失败局拆开：死在**哪一堵墙**、赶路来不来得及、最后 30 帧有没有朝缺口走 |
+| `research/gap_gif.py` | 训练好的策略放回 v3 场景跑，输出 GIF + 自机/缺口横向轨迹图 |
+| `research/gap_report.py` | 存活饱和时改看"飞行方式"（擦弹、最近弹距、横移占比） |
 | `research/gap_benchmark.py` | 避弹基准：站着不动 vs 斥力老师 vs 时空规划器 |
 
 ```powershell
-.\.venv\Scripts\python.exe tools\research\gap_rl.py --arm geo --updates 25 `
-    --bc-episodes 30 --bc-epochs 8 --bc-coef 2.0 --shaping 2.0
+# 正式链路（v3 上目前最好的一组）
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py --bench v3 --label reach `
+    --bc-episodes 60 --dagger-episodes 100 --rl-episodes 120 `
+    --eval-every 20 --eval-phases 3 --rand --kl-anchor 1.0
 
-# 正式链路: 缺口观测 + 过面进度奖励 + slack 标签, 留出场景评估
-.\.venv\Scripts\python.exe tools\research\gap_trainer.py --bench v2 --label slack `
-    --reward gap_survive --bc-episodes 30 --dagger-episodes 60 --rl-episodes 200
+# 失败诊断：每一局死在哪、来不来得及
+.\.venv\Scripts\python.exe tools\research\gap_diagnose.py --run .runtime\runs\v3-anchor1
+.\.venv\Scripts\python.exe tools\research\gap_diagnose.py --run .runtime\runs\v3-anchor1 --teacher
+
+# 看它怎么飞（9 局 GIF + 轨迹）
+.\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\v3-anchor1 --all
 ```
 
 ## train — 训练入口

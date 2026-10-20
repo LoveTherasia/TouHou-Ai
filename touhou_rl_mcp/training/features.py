@@ -499,7 +499,8 @@ class ObservationEncoder:
                  use_invincible: bool = False, use_boss: bool = False,
                  use_danger_grad: bool = False,
                  use_gap: bool = False, gap_grid: bool = True, gap_geo: bool = True,
-                 gap_clearance: bool = True, gap_prev_action: bool = True) -> None:
+                 gap_clearance: bool = True, gap_prev_action: bool = True,
+                 gap_layers: int = 1) -> None:
         self.use_grid = bool(use_grid)
         self.grid_size = int(grid_size)
         self.grid_span = float(grid_span)
@@ -515,6 +516,7 @@ class ObservationEncoder:
         self.gap_geo = bool(gap_geo)
         self.gap_clearance = bool(gap_clearance)
         self.gap_prev_action = bool(gap_prev_action)
+        self.gap_layers = int(gap_layers)
 
     @classmethod
     def from_meta(cls, meta: dict | None = None) -> "ObservationEncoder":
@@ -535,6 +537,7 @@ class ObservationEncoder:
             gap_geo=bool(meta.get("gap_geo", True)),
             gap_clearance=bool(meta.get("gap_clearance", True)),
             gap_prev_action=bool(meta.get("gap_prev_action", True)),
+            gap_layers=int(meta.get("gap_layers", 1) or 1),
         )
 
     @property
