@@ -73,6 +73,10 @@
 .\.venv\Scripts\python.exe tools\research\viability_probe.py `
     --fracs 0.59,0.65,0.71,0.77,0.83,0.89,0.95 `
     --max-frames 2400 --dt 3 --horizon 120 --noop
+
+# 未来生成已知的环形弹（规划器能找到上穿/横向对齐）
+.\.venv\Scripts\python.exe tools\research\viability_probe.py `
+    --pattern ring_gate --dt 3 --horizon 120 --noop
 ```
 
 ## train — 训练入口

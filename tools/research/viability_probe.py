@@ -190,11 +190,13 @@ class ViabilityPlanner:
         return action
 
 
-def make_env(script: str, dt: int) -> TouhouEnv:
+def make_env(script: str, dt: int, pattern: str = "") -> TouhouEnv:
     cfg = Config.load()
     cfg.patch({
-        "backend": "mock", "game": "th11", "danmaku_pattern": "",
-        "danmaku_script": script, "step_frames": int(dt),
+        "backend": "mock", "game": "th11",
+        "danmaku_pattern": pattern,
+        "danmaku_script": "" if pattern else script,
+        "step_frames": int(dt),
         "max_episode_frames": 0, "auto_reset": False, "reward": {},
     })
     env = TouhouEnv(cfg)
@@ -232,6 +234,8 @@ def run(env: TouhouEnv, planner: ViabilityPlanner | None, frac: float,
 def main() -> int:
     ap = argparse.ArgumentParser(description="时间展开可行集规划器 · 真机回放")
     ap.add_argument("--script", default=".runtime/danmaku/th11_replay_full.json")
+    ap.add_argument("--pattern", default="",
+                    help="改用合成弹型 (如 ring_gate / closing_ring); 给了它就不读 script")
     ap.add_argument("--fracs", default="0.71,0.83,0.89")
     ap.add_argument("--max-frames", type=int, default=2400)
     ap.add_argument("--dt", type=int, default=3)
@@ -245,8 +249,11 @@ def main() -> int:
     args = ap.parse_args()
 
     fracs = [float(x) for x in args.fracs.split(",") if x.strip()]
-    env = make_env(args.script, args.dt)
-    print(f"script={args.script} length={script_length(env)}  dt={args.dt}  "
+    if args.pattern:
+        fracs = [0.0]
+    env = make_env(args.script, args.dt, pattern=args.pattern)
+    where = f"pattern={args.pattern}" if args.pattern else f"script={args.script}"
+    print(f"{where} length={script_length(env)}  dt={args.dt}  "
           f"horizon={args.horizon}  grid={args.grid}")
     results = []
     for frac in fracs:
