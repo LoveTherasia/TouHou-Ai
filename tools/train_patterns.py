@@ -58,6 +58,8 @@ def main() -> int:
     ap.add_argument("--max-steps", type=int, default=6000)
     ap.add_argument("--out", default=".runtime/patterns")
     ap.add_argument("--patterns", default="", help="只训这些 (逗号分隔; 空=全部)")
+    ap.add_argument("--teacher", default="rule_dagger", choices=["rule_dagger", "none"],
+                    help="rule_dagger=规则老师+DAgger (旧默认); none=纯 PPO")
     args = ap.parse_args()
 
     names = [p.strip() for p in args.patterns.split(",") if p.strip()] or pattern_names()
@@ -71,7 +73,8 @@ def main() -> int:
         env = make_env(pat)
         tc = TrainConfig(episodes=args.episodes, max_steps=args.max_steps, step_frames=1,
                          batch_episodes=8, lr=1e-3, entropy_coef=0.02, hidden=(256, 256),
-                         teacher="rule_dagger", dagger_beta=0.4, danger_weight=3.0,
+                         teacher=("" if args.teacher == "none" else args.teacher),
+                         dagger_beta=0.4, danger_weight=3.0,
                          teacher_epochs=20, ppo_minibatch=512,
                          capture_every=0, eval_every=0, save_every=40,
                          out_dir=str(d), **TC_F)

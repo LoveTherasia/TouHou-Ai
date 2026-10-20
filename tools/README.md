@@ -73,7 +73,7 @@
 
 | 脚本 | 用途 |
 |---|---|
-| `train_patterns.py` | 按弹幕类型分别训练专属策略（每类一个） |
+| `train_patterns.py` | 按弹幕类型分别训练专属策略（每类一个）；`--teacher none` = 纯 PPO |
 | `train_loadouts.py` | 在真机各机体组合上分别继续训练一个已有 checkpoint |
 | `dual_train.py` | 双线程：真机线程 + mock 线程共享同一策略 |
 | `dual_proc_train.py` | 双进程 + 周期合并（配 `mock_worker.py`） |

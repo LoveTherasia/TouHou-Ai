@@ -378,11 +378,32 @@ class AimedSpread(Pattern):
             aimed(game, self.x, self.y, self.count, self.spread, self.speed)
 
 
+class AimedSingle(Pattern):
+    """单颗斜向自机狙: 最小的"会躲一颗弹"回归场景。
+
+    `aimed_spread` 是 4 连; 这个只打一颗, 但发射点偏离自机正上方 (x=100),
+    用来检查策略是否真的按弹道躲避, 而不是只学会"站在缺口/正中间"。
+    """
+
+    name = "aimed_single"
+    count = 1
+    spread = 0.0
+    speed = 2.4
+    interval = 30
+    x = 100.0
+    y = 96.0
+
+    def update(self, game: Any) -> None:
+        if game.frame % self.interval == 0:
+            aimed(game, self.x, self.y, self.count, self.spread, self.speed)
+
+
 # ----------------------------------------------------------------------
 _REGISTRY: dict[str, type[Pattern]] = {
     c.name: c for c in (
         DenseRing, ExpandingHomingRing, AimedTrail, StaticSwarm,
-        Spiral, Fan, WallGap, WallGate, ClosingRing, RingGate, RandomSpray, Flower, AimedSpread,
+        Spiral, Fan, WallGap, WallGate, ClosingRing, RingGate, RandomSpray, Flower,
+        AimedSpread, AimedSingle,
     )
 }
 
@@ -401,6 +422,7 @@ PATTERN_DOCS: dict[str, str] = {
     "random_spray": "随机爆散",
     "flower": "n 重对称花弹",
     "aimed_spread": "自机狙 n 连",
+    "aimed_single": "单颗斜向自机狙 (最小躲避回归场景)",
 }
 
 
