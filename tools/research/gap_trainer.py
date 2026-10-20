@@ -45,8 +45,10 @@ from touhou_rl_mcp.env import TouhouEnv                       # noqa: E402
 from touhou_rl_mcp.rl.reward import reward_profile            # noqa: E402
 from touhou_rl_mcp.training.features import gap_encoder, gap_spec_from  # noqa: E402
 from touhou_rl_mcp.training.gap_label import (                # noqa: E402
-    COMMIT_FRAMES, LABEL_MODES, MACRO_ACTIONS, gap_label,
+    COMMIT_FRAMES, MACRO_ACTIONS, TEACHER_MODES, direction_sign, update_action_age,
 )
+from touhou_rl_mcp.training.gap_teacher import GapTeacher        # noqa: E402
+from touhou_rl_mcp.training.occupancy import lane_safety         # noqa: E402
 from touhou_rl_mcp.training.trainer import (                  # noqa: E402
     TrainConfig, Trainer, apply_scenario,
 )
@@ -57,6 +59,9 @@ ARMS: dict[str, dict[str, bool]] = {
     "grid": dict(gap_grid=True, gap_geo=False, gap_clearance=False),
     "both": dict(gap_grid=True, gap_geo=True, gap_clearance=True),
 }
+
+#: 动作名 -> 下标 (老师输出的是名字, 评估时和策略动作比较)
+ACTION_INDEX: dict[str, int] = {name: i for i, name in enumerate(MACRO_ACTIONS)}
 
 
 def random_ranges(base: dict[str, float]) -> dict[str, list[float]]:
@@ -139,8 +144,12 @@ def make_trainer(env: TouhouEnv, args: argparse.Namespace,
         use_gap=True,
         **ARMS[args.arm],
         gap_prev_action=True,
+        gap_action_age=bool(getattr(args, "action_age", False)),
+        gap_action_age_cap=int(getattr(args, "action_age_cap", 12) or 12),
         gap_layers=args.gap_layers,
         gap_label=args.label,
+        gap_commit_frames=int(getattr(args, "commit_frames", 0) or 0),
+        gap_hysteresis=float(getattr(args, "hysteresis", 0.0) or 0.0),
         scenario=dict(scenario),
         # 缺口相位每局重采: 否则 2400 帧的基准退化成"同一个局面重复 N 次"
         # --rand 再把间隔/弹速/缺口宽度/漂移方向一起张开 (域随机化)
@@ -166,84 +175,151 @@ def make_trainer(env: TouhouEnv, args: argparse.Namespace,
 
 
 # ----------------------------------------------------------------------
+def _choose_eval_action(trainer: Trainer, obs: np.ndarray, state: Any,
+                        spec: Any, *, sticky: int, hold: int,
+                        last_action: int) -> tuple[int, int]:
+    """评估时的动作选择: 可选"粘住上一步动作"的承诺包装。
+
+    ``sticky`` 只影响推理, 不改训练。它用来回答一个独立问题: **如果只是让动作
+    多保持几步, 抖动带来的损失能不能直接拿回来?** 当自机所在车道很危险
+    (``lane_safety`` 接近 0) 时立刻解除保持, 避免把"粘住"变成"粘死"。
+    """
+    if sticky > 0 and hold > 0 and lane_safety(state, spec) > 0.05:
+        return last_action, hold - 1
+    with trainer.policy_lock:
+        action = int(trainer.policy.greedy(obs))
+    return action, max(0, sticky - 1)
+
+
+def _rollout(env: TouhouEnv, trainer: Trainer, state: Any, *,
+             max_frames: int, label_mode: str, commit_frames: int,
+             hysteresis: float, sticky: int, action_age_cap: int
+             ) -> tuple[int, float, float, float, float]:
+    """从 ``state`` 开始贪心跑到死亡或帧数上限。
+
+    返回 ``(存活帧数, 与老师一致率, 策略动作切换率, 老师动作切换率, 左右反向率)``。
+    切换率是 P1 的核心指标: 抖动表现为"两个几乎等价的缺口之间每步换边"。
+    左右反向率只看 left<->right 的翻转, 不会被"走到目标后变 stay"污染。
+    """
+    enc = gap_encoder(trainer.config)
+    spec = gap_spec_from(trainer.config)
+    # 老师必须每局新建: reach_hold / reach_hyst 的承诺状态不能跨局泄漏
+    teacher = GapTeacher(spec, mode=label_mode,
+                         commit_frames=commit_frames, hysteresis=hysteresis)
+    survival = 0
+    prev = -1
+    prev_expected = -1
+    age = 0
+    hold = 0
+    last_action = 0
+    hits = total = 0
+    policy_switches = label_switches = reversals = 0
+    prev_sign = 0
+    while survival < max_frames:
+        obs = enc(state, prev_action=prev, action_age=age)
+        action, hold = _choose_eval_action(
+            trainer, obs, state, spec, sticky=sticky, hold=hold,
+            last_action=last_action)
+        expected_name, _info = teacher.choose(state, state.frame)
+        expected = ACTION_INDEX[expected_name]
+        hits += int(action == expected)
+        if prev >= 0:
+            policy_switches += int(action != prev)
+        if prev_expected >= 0:
+            label_switches += int(expected != prev_expected)
+        sign = direction_sign(action)
+        if prev_sign and sign and sign != prev_sign:
+            reversals += 1
+        if sign:
+            prev_sign = sign
+        total += 1
+        result = env.step(MACRO_ACTIONS[action], frames=COMMIT_FRAMES,
+                          auto_reset=False)
+        state = result.state
+        survival += COMMIT_FRAMES
+        age = update_action_age(prev, age, action, action_age_cap)
+        prev = action
+        prev_expected = expected
+        last_action = action
+        if result.done:
+            break
+    denom = max(1, total - 1)
+    return survival, (hits / total if total else 0.0), \
+        (policy_switches / denom), (label_switches / denom), (reversals / denom)
+
+
 def evaluate(env: TouhouEnv, trainer: Trainer,
              heldout: tuple[dict[str, float], ...], *, max_frames: int,
-             label_mode: str, phases: tuple[float, ...] = (0.0,)) -> dict[str, Any]:
+             label_mode: str, phases: tuple[float, ...] = (0.0),
+             commit_frames: int = 0, hysteresis: float = 0.0,
+             sticky: int = 0, action_age_cap: int = 12) -> dict[str, Any]:
     """在**未见过的**场景上贪心跑, 回来存活帧数 / 与标签的一致率。
 
     ``phases`` 是叠加在场景 ``gap_phase`` 上的相位偏移。**必须多于一个**: 弹幕墙
     每堵横移 ``drift*360`` px, 初始相位差 1/3 就是完全不同的死法, 3 局平均的
     方差足以把"学会"和"运气好"混在一起。v3 上实测同一策略的局间极差能到 900 帧。
     """
-    enc = gap_encoder(trainer.config)
-    spec = gap_spec_from(trainer.config)
     frames: list[int] = []
     agree: list[float] = []
+    policy_switch: list[float] = []
+    label_switch: list[float] = []
+    reversal: list[float] = []
     for scenario in heldout:
         for offset in phases:
             sc = dict(scenario)
-            sc["gap_phase"] = float(sc.get("gap_phase", 0.0)) + float(offset)
+            sc["gap_phase"] = (float(sc.get("gap_phase", 0.0)) + float(offset)) % 1.0
             state = env.reset(seed=101).state
             apply_scenario(env, sc)
-            survival = 0
-            prev = -1
-            hits = total = 0
-            while survival < max_frames:
-                obs = enc(state, prev_action=prev)
-                with trainer.policy_lock:
-                    action = int(trainer.policy.greedy(obs))
-                hits += int(action == gap_label(state, spec, label_mode))
-                total += 1
-                result = env.step(MACRO_ACTIONS[action], frames=COMMIT_FRAMES,
-                                  auto_reset=False)
-                state = result.state
-                survival += COMMIT_FRAMES
-                prev = action
-                if result.done:
-                    break
+            survival, rate, pswitch, lswitch, rev = _rollout(
+                env, trainer, state, max_frames=max_frames, label_mode=label_mode,
+                commit_frames=commit_frames, hysteresis=hysteresis,
+                sticky=sticky, action_age_cap=action_age_cap)
             frames.append(survival)
-            agree.append(hits / total if total else 0.0)
+            agree.append(rate)
+            policy_switch.append(pswitch)
+            label_switch.append(lswitch)
+            reversal.append(rev)
     return {
         "frames": frames,
         "mean": float(np.mean(frames)) if frames else 0.0,
         "min": float(np.min(frames)) if frames else 0.0,
         "agree": float(np.mean(agree)) if agree else 0.0,
+        "policy_switch": float(np.mean(policy_switch)) if policy_switch else 0.0,
+        "label_switch": float(np.mean(label_switch)) if label_switch else 0.0,
+        "reversal": float(np.mean(reversal)) if reversal else 0.0,
     }
 
 
 def evaluate_script(env: TouhouEnv, trainer: Trainer, fractions: tuple[float, ...],
-                    *, max_frames: int, label_mode: str) -> dict[str, Any]:
+                    *, max_frames: int, label_mode: str,
+                    commit_frames: int = 0, hysteresis: float = 0.0,
+                    sticky: int = 0, action_age_cap: int = 12) -> dict[str, Any]:
     """在**没训练过的脚本片段**上贪心跑 (真假弹幕模式的评估)。"""
-    enc = gap_encoder(trainer.config)
-    spec = gap_spec_from(trainer.config)
     frames: list[int] = []
     agree: list[float] = []
+    policy_switch: list[float] = []
+    label_switch: list[float] = []
+    reversal: list[float] = []
     for frac in fractions:
         apply_script_offset(env, float(frac))
         state = env.reset(seed=101).state
-        survival = 0
-        prev = -1
-        hits = total = 0
-        while survival < max_frames:
-            obs = enc(state, prev_action=prev)
-            with trainer.policy_lock:
-                action = int(trainer.policy.greedy(obs))
-            hits += int(action == gap_label(state, spec, label_mode))
-            total += 1
-            result = env.step(MACRO_ACTIONS[action], frames=COMMIT_FRAMES,
-                              auto_reset=False)
-            state = result.state
-            survival += COMMIT_FRAMES
-            prev = action
-            if result.done:
-                break
+        survival, rate, pswitch, lswitch, rev = _rollout(
+            env, trainer, state, max_frames=max_frames, label_mode=label_mode,
+            commit_frames=commit_frames, hysteresis=hysteresis,
+            sticky=sticky, action_age_cap=action_age_cap)
         frames.append(survival)
-        agree.append(hits / total if total else 0.0)
+        agree.append(rate)
+        policy_switch.append(pswitch)
+        label_switch.append(lswitch)
+        reversal.append(rev)
     return {
         "frames": frames,
         "mean": float(np.mean(frames)) if frames else 0.0,
         "min": float(np.min(frames)) if frames else 0.0,
         "agree": float(np.mean(agree)) if agree else 0.0,
+        "policy_switch": float(np.mean(policy_switch)) if policy_switch else 0.0,
+        "label_switch": float(np.mean(label_switch)) if label_switch else 0.0,
+        "reversal": float(np.mean(reversal)) if reversal else 0.0,
     }
 
 
@@ -270,7 +346,87 @@ def _write_row(path: Path, step: int, name: str, score: float,
 def _fmt(result: dict[str, Any]) -> str:
     return (f"泛化 {result['mean']:6.0f} 帧 (最差 {result['min']:4.0f})  "
             f"一致率 {result['agree']:4.0%}  "
+            f"切换 {result.get('policy_switch', 0.0):4.0%}  "
+            f"反向 {result.get('reversal', 0.0):4.0%}  "
             f"{[int(x) for x in result['frames']]}")
+
+
+def _split_fracs(text: str, default: str) -> tuple[float, ...]:
+    raw = text.strip() or default
+    return tuple(float(x) for x in raw.split(",") if x.strip())
+
+
+def _phase_sets(count: int) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """bench 模式: dev 用 0,1/n,...; test 用错开半个步长的相位。
+
+    这是 P0 的最低成本拆分 —— 场景本身仍是同一批 heldout, 只换了起始相位。
+    真正的独立测试仍应换场景或换回放, 见 docs/GAP_LEARNING.md。
+    """
+    n = max(1, int(count))
+    dev = tuple(i / n for i in range(n))
+    test = tuple(((i + 0.5) / n) % 1.0 for i in range(n))
+    return dev, test
+
+
+def _eval_only(args: argparse.Namespace) -> int:
+    """P0: 只做 dev/test 评估, 不改权重。用于给历史 run 一个诚实的数字。"""
+    run_dir = Path(args.run_dir)
+    meta_path = run_dir / "meta.json"
+    policy_path = run_dir / "policy.json"
+    if not meta_path.exists() or not policy_path.exists():
+        raise SystemExit(f"--eval-only 需要 {run_dir} 下有 meta.json 和 policy.json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    policy_meta = json.loads(policy_path.read_text(encoding="utf-8"))
+    config = TrainConfig.from_dict(policy_meta["config"])
+    script = args.script or str(meta.get("danmaku_script") or "")
+
+    dev = _split_fracs(args.dev, args.script_eval)
+    test = _split_fracs(args.test, args.script_eval)
+    env = build_env({}, {}, script=script)
+    trainer = Trainer(env, config, out_dir=run_dir)
+    ckpt = run_dir / ("policy" if args.last else
+                      ("policy_best" if (run_dir / "policy_best.npz").exists() else "policy"))
+    trainer.load(ckpt)
+
+    if script:
+        dev_result = evaluate_script(
+            env, trainer, dev, max_frames=args.max_frames, label_mode=config.gap_label,
+            commit_frames=config.gap_commit_frames, hysteresis=config.gap_hysteresis,
+            sticky=args.sticky, action_age_cap=config.gap_action_age_cap)
+        test_result = evaluate_script(
+            env, trainer, test, max_frames=args.max_frames, label_mode=config.gap_label,
+            commit_frames=config.gap_commit_frames, hysteresis=config.gap_hysteresis,
+            sticky=args.sticky, action_age_cap=config.gap_action_age_cap)
+    else:
+        heldout = tuple(meta.get("heldout") or ())
+        dev_phases, test_phases = _phase_sets(args.eval_phases)
+        dev_result = evaluate(
+            env, trainer, heldout, max_frames=args.max_frames,
+            label_mode=config.gap_label, phases=dev_phases,
+            commit_frames=config.gap_commit_frames, hysteresis=config.gap_hysteresis,
+            sticky=args.sticky, action_age_cap=config.gap_action_age_cap)
+        test_result = evaluate(
+            env, trainer, heldout, max_frames=args.max_frames,
+            label_mode=config.gap_label, phases=test_phases,
+            commit_frames=config.gap_commit_frames, hysteresis=config.gap_hysteresis,
+            sticky=args.sticky, action_age_cap=config.gap_action_age_cap)
+
+    report = {
+        "run": str(run_dir), "checkpoint": str(ckpt),
+        "dev": dev_result, "test": test_result,
+        "sticky": int(args.sticky),
+        "note": "dev 用于选择, test 只用于报告; 两者不应重叠",
+    }
+    out = run_dir / (f"eval-honest-sticky{int(args.sticky)}.json" if args.sticky
+                     else "eval-honest.json")
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                   encoding="utf-8")
+    print(f"checkpoint: {ckpt.name}")
+    print(f"dev : {_fmt(dev_result)}")
+    print(f"test: {_fmt(test_result)}")
+    print(f"-> {out}")
+    env.close()
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -285,9 +441,31 @@ def main() -> int:
                     metavar=("LO", "HI"),
                     help="训练可用的脚本区间 (占长度比例); 默认把最后 25%% 留作未见片段")
     ap.add_argument("--script-eval", default="0.80,0.87,0.94",
-                    help="评估用的脚本位置 (逗号分隔比例), 应当在训练区间之外")
-    ap.add_argument("--label", choices=LABEL_MODES, default="slack",
-                    help="弱监督标签口径 (now/reach/future/slack)")
+                    help="评估用的脚本位置 (逗号分隔比例), 应当在训练区间之外; "
+                         "未给 --dev/--test 时同时用于两者 (旧行为)")
+    ap.add_argument("--dev", default="",
+                    help="选择 policy_best 用的 dev 片段 (逗号分隔比例)。"
+                         "必须是训练区间之外的留出片段, 但**不能**和 --test 重叠")
+    ap.add_argument("--test", default="",
+                    help="只在最后报一次的 test 片段 (逗号分隔比例)。"
+                         "默认沿用 --script-eval; 修 P0 时请显式给独立片段")
+    ap.add_argument("--label", choices=TEACHER_MODES, default="slack",
+                    help="弱监督标签口径 (now/reach/future/slack; "
+                         "reach_hold/reach_hyst 需要 --commit-frames/--hysteresis)")
+    ap.add_argument("--commit-frames", type=int, default=0,
+                    help="reach_hold 的承诺时长 (帧); 0=关")
+    ap.add_argument("--hysteresis", type=float, default=0.0,
+                    help="reach_hyst 的滞回阈值 (帧): 新目标必须好这么多才切换")
+    ap.add_argument("--action-age", action="store_true",
+                    help="观测加入'连续同向决策步数' (1 维), 给策略可部署的承诺记忆")
+    ap.add_argument("--action-age-cap", type=int, default=12,
+                    help="动作年龄归一化上限 (决策步)")
+    ap.add_argument("--sticky", type=int, default=0,
+                    help="推理时动作保持步数 (0=关); 用于检验抖动本身的代价")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="不训练: 读取 --run-dir 的 policy/policy_best, 在 dev/test 上评估")
+    ap.add_argument("--last", action="store_true",
+                    help="--eval-only 时读最后一版 policy 而不是 policy_best")
     ap.add_argument("--reward", default="gap_survive",
                     help="奖励 profile 名 (见 rl/reward.py 的 REWARD_PROFILES); "
                          "default = 不改奖励, 用 config.json 那套")
@@ -329,11 +507,17 @@ def main() -> int:
                     help="训练记录目录 (默认 .runtime/runs/<...>; 看板可直接读取)")
     args = ap.parse_args()
 
+    if args.eval_only:
+        return _eval_only(args)
+
     if args.script:
         train_scenario, heldout = {}, ()
-        eval_fracs = tuple(float(x) for x in args.script_eval.split(",") if x.strip())
+        dev_fracs = _split_fracs(args.dev, args.script_eval)
+        test_fracs = _split_fracs(args.test, args.script_eval)
+        eval_fracs = dev_fracs
     else:
         train_scenario, heldout = BENCHMARKS[args.bench]
+        dev_fracs = test_fracs = ()
         eval_fracs = ()
     # ``--reward default`` = 不动奖励 (用 config.json 里那套危险度惩罚), 作为对照组
     reward = {} if args.reward == "default" else reward_profile(args.reward)
@@ -357,7 +541,7 @@ def main() -> int:
           f"run={out_dir}")
     if args.script:
         print(f"脚本长度 {script_length(env)} 帧, 训练区间 {args.script_train_range}, "
-              f"留出片段 {eval_fracs}")
+              f"dev {dev_fracs}, test {test_fracs}")
     else:
         print(f"train scenario: {train_scenario}")
         if args.rand:
@@ -367,8 +551,13 @@ def main() -> int:
         "script": "tools/research/gap_trainer.py",
         "bench": ("script" if args.script else args.bench),
         "danmaku_script": str(args.script or ""),
+        "dev_fracs": list(dev_fracs),
+        "test_fracs": list(test_fracs),
         "eval_fracs": list(eval_fracs),
         "label": args.label, "arm": args.arm,
+        "commit_frames": int(args.commit_frames),
+        "hysteresis": float(args.hysteresis),
+        "action_age": bool(args.action_age),
         "reward": args.reward, "gap_margin": args.gap_margin,
         "rand": bool(args.rand),
         "train_ranges": ([list(args.script_train_range)] if args.script else
@@ -379,6 +568,7 @@ def main() -> int:
         "heldout": [dict(s) for s in heldout],
         "args": vars(args),
         "phases": [],
+        "protocol": "dev=选择 policy_best; test=只报告一次",
     }
 
     def flush_meta() -> None:
@@ -389,24 +579,30 @@ def main() -> int:
     def step_index() -> int:
         return len(trainer.episodes)
 
-    #: 相位偏移: 0 加上均匀切分的其余相位, 每个场景多跑几局
-    phase_offsets = tuple(
-        i / max(1, args.eval_phases) for i in range(max(1, args.eval_phases)))
+    #: 相位偏移: dev 用 0,1/n,...; test 用错开半个步长的相位 (见 _phase_sets)
+    phase_offsets, test_phase_offsets = _phase_sets(args.eval_phases)
 
     best = {"mean": -1.0, "step": 0, "tag": ""}
 
-    def eval_and_log(tag: str) -> dict[str, Any]:
+    def _evaluate_on(fractions: tuple[float, ...],
+                     phases: tuple[float, ...]) -> dict[str, Any]:
+        kwargs = dict(
+            max_frames=args.max_frames, label_mode=args.label,
+            commit_frames=args.commit_frames, hysteresis=args.hysteresis,
+            sticky=args.sticky, action_age_cap=args.action_age_cap)
         if args.script:
-            result = evaluate_script(env, trainer, eval_fracs,
-                                     max_frames=args.max_frames, label_mode=args.label)
-        else:
-            result = evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                              label_mode=args.label, phases=phase_offsets)
+            return evaluate_script(env, trainer, fractions, **kwargs)
+        return evaluate(env, trainer, heldout, phases=phases, **kwargs)
+
+    def eval_and_log(tag: str) -> dict[str, Any]:
+        # P0: 只在一个评估集上选权重。默认 dev; 若用户没拆, dev=test, 会打印警告。
+        result = _evaluate_on(dev_fracs, phase_offsets)
         _write_row(eval_path, step_index(), tag, result["mean"], result["frames"],
                    agree=round(result["agree"], 4),
+                   switch=round(result.get("policy_switch", 0.0), 4),
                    min_frames=round(result["min"], 1))
         # 逐段择优: 训练只覆盖"最后一版"会丢掉中途更好的权重 (脚本模式实测
-        # 2218 -> 1992 的回落), 而评估是唯一可信的选型依据。
+        # 2218 -> 1992 的回落), 而 dev 是唯一可信的选型依据。
         if result["mean"] > best["mean"]:
             best.update(mean=result["mean"], step=step_index(), tag=tag)
             trainer.save(out_dir / "policy_best")
@@ -454,21 +650,58 @@ def main() -> int:
     if not trainer.episodes:
         eval_and_log("untrained")
     trainer.save()
-    final = (evaluate_script(env, trainer, eval_fracs, max_frames=args.max_frames,
-                             label_mode=args.label)
-             if args.script else
-             evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                      label_mode=args.label, phases=phase_offsets))
-    meta["best"] = {"mean_frames": round(best["mean"], 1),
-                    "step": best["step"], "phase": best["tag"]}
-    meta["final"] = {"mean_frames": round(final["mean"], 1),
-                     "min_frames": round(final["min"], 1),
-                     "agree": round(final["agree"], 4),
-                     "detail": [int(x) for x in final["frames"]]}
+
+    # P0: dev 上选出的 policy_best 与最后一版分开报告; test 只在这里看一次。
+    dev_last = _evaluate_on(dev_fracs, phase_offsets)
+    test_last = _evaluate_on(test_fracs, test_phase_offsets)
+    _write_row(eval_path, step_index(), "dev-last", dev_last["mean"],
+               dev_last["frames"], agree=round(dev_last["agree"], 4),
+               switch=round(dev_last.get("policy_switch", 0.0), 4))
+    _write_row(eval_path, step_index(), "test-last", test_last["mean"],
+               test_last["frames"], agree=round(test_last["agree"], 4),
+               switch=round(test_last.get("policy_switch", 0.0), 4))
+
+    best_path = out_dir / "policy_best.npz"
+    test_best: dict[str, Any] | None = None
+    if best_path.exists():
+        trainer.load(out_dir / "policy_best")
+        test_best = _evaluate_on(test_fracs, test_phase_offsets)
+        _write_row(eval_path, best["step"], "test-best", test_best["mean"],
+                   test_best["frames"], agree=round(test_best["agree"], 4),
+                   switch=round(test_best.get("policy_switch", 0.0), 4))
+
+    meta["best"] = {
+        "dev_mean_frames": round(best["mean"], 1),
+        "step": best["step"], "phase": best["tag"],
+        "test_mean_frames": None if test_best is None else round(test_best["mean"], 1),
+        "test_detail": None if test_best is None else [int(x) for x in test_best["frames"]],
+    }
+    meta["dev"] = {"mean_frames": round(dev_last["mean"], 1),
+                   "min_frames": round(dev_last["min"], 1),
+                   "agree": round(dev_last["agree"], 4),
+                   "switch": round(dev_last.get("policy_switch", 0.0), 4),
+                   "reversal": round(dev_last.get("reversal", 0.0), 4),
+                   "label_switch": round(dev_last.get("label_switch", 0.0), 4),
+                   "detail": [int(x) for x in dev_last["frames"]]}
+    meta["test"] = {"mean_frames": round(test_last["mean"], 1),
+                    "min_frames": round(test_last["min"], 1),
+                    "agree": round(test_last["agree"], 4),
+                    "switch": round(test_last.get("policy_switch", 0.0), 4),
+                    "reversal": round(test_last.get("reversal", 0.0), 4),
+                    "label_switch": round(test_last.get("label_switch", 0.0), 4),
+                    "detail": [int(x) for x in test_last["frames"]]}
+    #: 兼容旧文档: final = **最后一版在 test 上**的结果, 不是 best
+    meta["final"] = meta["test"]
     flush_meta()
-    print(f"\n最终: {_fmt(final)}")
-    print(f"最好的一版: {best['mean']:.0f} 帧 (step {best['step']}, {best['tag']}) "
+
+    print(f"\ndev (last) : {_fmt(dev_last)}")
+    print(f"test (last): {_fmt(test_last)}")
+    if test_best is not None:
+        print(f"test (best @ {best['step']}): {_fmt(test_best)}")
+    print(f"选择依据: dev 最好 {best['mean']:.0f} 帧 (step {best['step']}, {best['tag']}) "
           f"-> {out_dir / 'policy_best.npz'}")
+    if list(dev_fracs) == list(test_fracs):
+        print("警告: dev 与 test 相同, 数字仍有选择偏差; 请显式给 --dev/--test")
     env.close()
     return 0
 

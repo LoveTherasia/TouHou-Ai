@@ -15,9 +15,11 @@ import unittest
 import numpy as np
 
 from touhou_rl_mcp.training.gap_label import (
-    LABEL_MODES, MACRO_ACTIONS, SECOND_GAP_FRAMES, gap_label, reach_target,
-    slack_label, tta_frames,
+    LABEL_MODES, MACRO_ACTIONS, SECOND_GAP_FRAMES, TEACHER_MODES,
+    GapCommitment, gap_label, reach_target, slack_label, tta_frames,
+    update_action_age,
 )
+from touhou_rl_mcp.training.gap_teacher import GapTeacher
 from touhou_rl_mcp.training.occupancy import GapSpec, _arrival_times
 from touhou_rl_mcp.training.trainer import build_action_table
 from touhou_rl_mcp.types import GameState, PLAYFIELD_WIDTH
@@ -147,6 +149,98 @@ class SlackDwellTest(unittest.TestCase):
         self.assertTrue(covered.size)
         col = int(covered[0])
         self.assertGreaterEqual(t2[col] - t1[col], SECOND_GAP_FRAMES - 1e-9)
+
+
+class CommitmentTest(unittest.TestCase):
+    """目标承诺 / 滞回的语义: 承诺期内不换目标, 不安全时立刻换。"""
+
+    class FakeCommitment(GapCommitment):
+        def __init__(self, slack, *, px=150.0, **kwargs):
+            super().__init__(GapSpec(), **kwargs)
+            self._centers = np.array([0.0, 100.0, 200.0, 300.0])
+            self._values = np.asarray(slack, dtype=np.float64)
+            self._px = float(px)
+
+        def _slack(self, state):
+            return self._centers, self._values, self._px
+
+    def test_hold_keeps_target_until_window_expires(self) -> None:
+        c = self.FakeCommitment([0.0, 50.0, 100.0, 0.0], mode="reach_hold",
+                                commit_frames=30)
+        _a, first = c.decide(GameState(), 0)
+        self.assertAlmostEqual(first["target"], 200.0)
+        # 新目标只比当前好 6 帧; 承诺期未到 -> 不换
+        c._values = np.array([0.0, 100.0, 95.0, 0.0])
+        _a, held = c.decide(GameState(), 6)
+        self.assertAlmostEqual(held["target"], 200.0)
+        self.assertEqual(held["reason"], "hold")
+        # 承诺期到期 -> 换到更好的目标
+        _a, expired = c.decide(GameState(), 31)
+        self.assertAlmostEqual(expired["target"], 100.0)
+        self.assertEqual(expired["reason"], "expired")
+
+    def test_hysteresis_needs_margin_to_switch(self) -> None:
+        c = self.FakeCommitment([0.0, 100.0, 95.0, 0.0], mode="reach_hyst",
+                                hysteresis=10.0)
+        _a, _info = c.decide(GameState(), 0)
+        # 初始就选最好的 100; 先强行把目标改成 200, 再验证 6 帧优势不够
+        c.target = 200.0
+        _a, kept = c.decide(GameState(), 6)
+        self.assertAlmostEqual(kept["target"], 200.0)
+        self.assertEqual(kept["reason"], "hold")
+
+        c2 = self.FakeCommitment([0.0, 100.0, 95.0, 0.0], mode="reach_hyst",
+                                 hysteresis=0.0)
+        c2.decide(GameState(), 0)
+        c2.target = 200.0
+        _a, switched = c2.decide(GameState(), 6)
+        self.assertAlmostEqual(switched["target"], 100.0)
+        self.assertEqual(switched["reason"], "hysteresis")
+
+    def test_unsafe_target_switches_even_during_hold(self) -> None:
+        c = self.FakeCommitment([0.0, 50.0, 100.0, 0.0], mode="reach_hold",
+                                commit_frames=30)
+        c.decide(GameState(), 0)
+        c._values = np.array([0.0, 100.0, -5.0, 0.0])
+        _a, info = c.decide(GameState(), 6)
+        self.assertEqual(info["reason"], "unsafe")
+        self.assertAlmostEqual(info["target"], 100.0)
+
+    def test_overshoot_does_not_reverse(self) -> None:
+        # 承诺目标在右侧, 6 帧一步跨过目标后不能反向回正 (那会制造新的左右抖动)
+        c = self.FakeCommitment([0.0, 50.0, 100.0, 0.0], mode="reach_hold",
+                                commit_frames=30)
+        c.decide(GameState(), 0)
+        c._px = 210.0
+        action, info = c.decide(GameState(), 6)
+        self.assertEqual(action, 0)
+        self.assertAlmostEqual(info["target"], 200.0)
+
+    def test_stateful_modes_are_not_stateless_labels(self) -> None:
+        self.assertIn("reach_hold", TEACHER_MODES)
+        self.assertIn("reach_hyst", TEACHER_MODES)
+        self.assertNotIn("reach_hold", LABEL_MODES)
+        with self.assertRaises(KeyError):
+            gap_label(GameState(player_x=192.0, player_y=400.0), GapSpec(),
+                      "reach_hold")
+
+    def test_action_age_counts_same_direction(self) -> None:
+        self.assertEqual(update_action_age(-1, 0, RIGHT), 1)
+        self.assertEqual(update_action_age(RIGHT, 1, RIGHT), 2)
+        self.assertEqual(update_action_age(RIGHT, 5, LEFT), 1)
+        self.assertEqual(update_action_age(RIGHT, 5, 0), 0)
+        self.assertEqual(update_action_age(RIGHT, 11, RIGHT, cap=12), 12)
+        self.assertEqual(update_action_age(RIGHT, 12, RIGHT, cap=12), 12)
+
+    def test_teacher_resets_commitment_per_episode(self) -> None:
+        teacher = GapTeacher(GapSpec(), mode="reach_hold", commit_frames=18)
+        state = state_at(192.0, wall(300.0, hole_x=60.0))
+        name, info = teacher.choose(state, 100)
+        self.assertIn(name, MACRO_ACTIONS)
+        self.assertIsNotNone(teacher.commit.target)
+        teacher.reset()
+        self.assertIsNone(teacher.commit.target)
+        self.assertEqual(teacher.commit.switches, 0)
 
 
 if __name__ == "__main__":

@@ -449,6 +449,8 @@ def gap_spec_from(config: Any) -> GapSpec:
         use_geo=bool(getattr(config, "gap_geo", True)),
         use_clearance=bool(getattr(config, "gap_clearance", True)),
         use_prev_action=bool(getattr(config, "gap_prev_action", True)),
+        use_action_age=bool(getattr(config, "gap_action_age", False)),
+        action_age_cap=int(getattr(config, "gap_action_age_cap", 12) or 12),
         tta_layers=int(getattr(config, "gap_layers", 1) or 1),
     )
 
@@ -500,6 +502,7 @@ class ObservationEncoder:
                  use_danger_grad: bool = False,
                  use_gap: bool = False, gap_grid: bool = True, gap_geo: bool = True,
                  gap_clearance: bool = True, gap_prev_action: bool = True,
+                 gap_action_age: bool = False, gap_action_age_cap: int = 12,
                  gap_layers: int = 1) -> None:
         self.use_grid = bool(use_grid)
         self.grid_size = int(grid_size)
@@ -516,6 +519,8 @@ class ObservationEncoder:
         self.gap_geo = bool(gap_geo)
         self.gap_clearance = bool(gap_clearance)
         self.gap_prev_action = bool(gap_prev_action)
+        self.gap_action_age = bool(gap_action_age)
+        self.gap_action_age_cap = int(gap_action_age_cap)
         self.gap_layers = int(gap_layers)
 
     @classmethod
@@ -537,6 +542,8 @@ class ObservationEncoder:
             gap_geo=bool(meta.get("gap_geo", True)),
             gap_clearance=bool(meta.get("gap_clearance", True)),
             gap_prev_action=bool(meta.get("gap_prev_action", True)),
+            gap_action_age=bool(meta.get("gap_action_age", False)),
+            gap_action_age_cap=int(meta.get("gap_action_age_cap", 12) or 12),
             gap_layers=int(meta.get("gap_layers", 1) or 1),
         )
 
@@ -554,14 +561,15 @@ class ObservationEncoder:
         return observation_dim(self)
 
     def __call__(self, state: GameState, out: np.ndarray | None = None,
-                 prev_action: int = -1) -> np.ndarray:
-        return encode_observation(state, self, out=out, prev_action=prev_action)
+                 prev_action: int = -1, action_age: int = 0) -> np.ndarray:
+        return encode_observation(state, self, out=out, prev_action=prev_action,
+                                  action_age=action_age)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         if self.use_gap:
             spec = self.gap_spec
             return (f"ObservationEncoder(gap grid={spec.use_grid} geo={spec.use_geo} "
-                    f"clearance={spec.use_clearance} dim={self.dim})")
+                    f"clearance={spec.use_clearance} age={spec.use_action_age} dim={self.dim})")
         if self.use_grid:
             scales = ",".join(f"{s}x{s}/±{sp:g}" for s, sp in self.scales)
             return (f"ObservationEncoder(grid[{scales}] vel={self.bullet_velocity} "
@@ -572,14 +580,17 @@ class ObservationEncoder:
 
 def encode_observation(state: GameState, config: Any,
                        out: np.ndarray | None = None,
-                       prev_action: int = -1) -> np.ndarray:
+                       prev_action: int = -1,
+                       action_age: int = 0) -> np.ndarray:
     """按 :class:`TrainConfig` 编码一帧 (缺口 / 危险图 / 最近K弹)。
 
     ``prev_action`` 只对 ``use_gap`` 有效 (方向下标 0~8, -1=未知), 用于把"上一动作"
     的 one-hot 拼进观测 —— 宏动作有 6 帧承诺, 策略必须知道自己在往哪走。
+    ``action_age`` 是"连续同向决策了多少步", 同样只对 ``use_gap`` 有效。
     """
     if getattr(config, "use_gap", False):
-        return gap_encoder(config)(state, prev_action=prev_action, out=out)
+        return gap_encoder(config)(state, prev_action=prev_action, out=out,
+                                   action_age=action_age)
     if getattr(config, "use_grid", False):
         return encode_state_grid(
             state,

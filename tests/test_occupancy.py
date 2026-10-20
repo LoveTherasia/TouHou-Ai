@@ -14,6 +14,7 @@ import numpy as np
 from touhou_rl_mcp.training.occupancy import (
     GapObservation, GapSpec, _bullets, _column_centers, _tta_profile, lane_safety,
 )
+from touhou_rl_mcp.training.features import ObservationEncoder
 from touhou_rl_mcp.types import GameState
 
 
@@ -204,6 +205,34 @@ class TtaLayersTest(unittest.TestCase):
         pos, vel = _bullets(state)
         self.assertTrue(np.allclose(obs[:spec.tta_cols],
                                     _tta_profile(416.0, pos, vel, spec)))
+
+
+class ActionAgeTest(unittest.TestCase):
+    """动作年龄是策略可部署的承诺记忆: 维度 +1, 数值按 cap 归一化。"""
+
+    def test_dim_and_value(self) -> None:
+        spec = GapSpec(use_grid=False, use_geo=False, use_clearance=False,
+                       use_action_age=True, action_age_cap=12)
+        enc = GapObservation(spec)
+        self.assertEqual(enc.dim, 7 + 9 + 1)  # globals + prev_action + age
+        state = GameState(player_x=192.0, player_y=400.0)
+        self.assertAlmostEqual(float(enc(state, prev_action=4, action_age=6)[-1]), 0.5)
+        self.assertAlmostEqual(float(enc(state, prev_action=-1, action_age=0)[-1]), 0.0)
+        self.assertAlmostEqual(float(enc(state, prev_action=4, action_age=99)[-1]), 1.0)
+
+    def test_default_dim_is_unchanged(self) -> None:
+        # 旧策略的 policy.json 没有 gap_action_age, 必须仍然按 70 维编码
+        spec = GapSpec(use_grid=False, use_geo=True, use_clearance=True)
+        self.assertEqual(GapObservation(spec).dim, 70)
+
+    def test_encoder_restores_age_from_meta(self) -> None:
+        old = ObservationEncoder.from_meta({"use_gap": True, "gap_grid": False})
+        self.assertEqual(old.dim, 70)
+        new = ObservationEncoder.from_meta(
+            {"use_gap": True, "gap_grid": False, "gap_action_age": True,
+             "gap_action_age_cap": 12})
+        self.assertEqual(new.dim, 71)
+        self.assertTrue(new.gap_action_age)
 
 
 if __name__ == "__main__":

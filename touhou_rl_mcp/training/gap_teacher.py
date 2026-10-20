@@ -7,34 +7,59 @@ BC / DAgger / 纯 RL 都能用同一套训练循环, 不再需要 ``tools/resear
 
 老师的输出是一串动作名 (如 ``"left+shoot"``), 由训练器用 ``_teacher_index`` 映射回
 自己的动作表下标 —— 与 ``TacticalGuard`` 完全一致。
-"""
 
+有状态口径
+----------
+``reach_hold`` / ``reach_hyst`` 需要一个 :class:`GapCommitment` 记住当前目标列。
+老师对象在 ``Trainer._run_episode`` 里**每局新建**, 所以承诺状态天然按局重置。
+评估脚本也必须每局新建一个老师, 不能跨局复用。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from ..types import GameState
-from .gap_label import MACRO_ACTIONS, gap_label
+from .gap_label import (
+    HOLD_MODES, MACRO_ACTIONS, GapCommitment, gap_label,
+)
 from .occupancy import GapSpec
 
 
 class GapTeacher:
-    """按缺口几何打标签的老师 (无参数, 无代价函数, 无状态)。"""
+    """按缺口几何打标签的老师 (无代价函数; 有状态口径带目标承诺)。"""
 
     #: 名字 -> 下标 (与 DIRECTIONS 同序), 供训练器反查
     actions: tuple[str, ...] = MACRO_ACTIONS
 
-    def __init__(self, spec: GapSpec | None = None, mode: str = "reach") -> None:
+    def __init__(self, spec: GapSpec | None = None, mode: str = "reach",
+                 commit_frames: int = 0, hysteresis: float = 0.0,
+                 safety_margin: float = 0.0) -> None:
         self.spec = spec or GapSpec()
         self.mode = mode
+        self.commit_frames = int(commit_frames)
+        self.hysteresis = float(hysteresis)
+        self.commit = (
+            GapCommitment(self.spec, mode=mode, commit_frames=self.commit_frames,
+                          hysteresis=self.hysteresis, safety_margin=safety_margin)
+            if mode in HOLD_MODES else None
+        )
+
+    def reset(self) -> None:
+        if self.commit is not None:
+            self.commit.reset()
 
     def choose(self, state: GameState, frame: int | None,
                learned_action: str = "") -> tuple[str, dict[str, Any]]:
         """返回 ``(动作名, 诊断信息)``; 与 ``TacticalGuard.choose`` 同签名。"""
         if state.player_x is None or state.player_y is None:
             raise ValueError("缺口标签需要有效的自机坐标")
-        index = gap_label(state, self.spec, self.mode)
+        if self.commit is not None:
+            index, info = self.commit.decide(state, frame)
+        else:
+            index = gap_label(state, self.spec, self.mode)
+            info = {"switched": False, "target": None}
         return MACRO_ACTIONS[index], {
+            **info,
             "gap_label": index,
             "gap_mode": self.mode,
             "frame": frame,
@@ -42,7 +67,20 @@ class GapTeacher:
         }
 
     def describe(self) -> dict[str, Any]:
-        return {"teacher": "gap", "mode": self.mode, **self.spec.__dict__}
+        out = {
+            "teacher": "gap",
+            "mode": self.mode,
+            "commit_frames": self.commit_frames,
+            "hysteresis": self.hysteresis,
+            **self.spec.__dict__,
+        }
+        if self.commit is not None:
+            out.update({
+                "target": self.commit.target,
+                "switches": self.commit.switches,
+                "decisions": self.commit.decisions,
+            })
+        return out
 
 
 __all__ = ["GapTeacher"]

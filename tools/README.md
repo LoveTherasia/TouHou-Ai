@@ -23,6 +23,28 @@
     --bc-episodes 60 --dagger-episodes 100 --rl-episodes 120 `
     --eval-every 20 --eval-phases 3 --rand --kl-anchor 1.0
 
+# P0: dev/test 分离。训练区间之外、互不重叠的两组片段
+# dev 只用于选 policy_best; test 只在最后报一次
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py `
+    --script .runtime\danmaku\th11_replay_full.json --script-train-range 0 0.55 `
+    --dev 0.56,0.62,0.68,0.74,0.80,0.86,0.92,0.98 `
+    --test 0.59,0.65,0.71,0.77,0.83,0.89,0.95 `
+    --label reach --bc-episodes 40 --dagger-episodes 60 --rl-episodes 40
+
+# P1: 目标承诺 / 滞回 / 动作年龄
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py `
+    --script .runtime\danmaku\th11_replay_full.json --script-train-range 0 0.55 `
+    --dev 0.56,0.62,0.68,0.74,0.80,0.86,0.92,0.98 `
+    --test 0.59,0.65,0.71,0.77,0.83,0.89,0.95 `
+    --label reach_hold --commit-frames 18 --action-age `
+    --bc-episodes 40 --dagger-episodes 60 --rl-episodes 40
+
+# 历史 run 的诚实评估（不训练，读 policy_best 或 --last 读最后一版）
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py --eval-only `
+    --run-dir .runtime\runs\script-best --last `
+    --dev 0.56,0.62,0.68,0.74,0.80,0.86,0.92,0.98 `
+    --test 0.59,0.65,0.71,0.77,0.83,0.89,0.95
+
 # 真机录制的弹幕（脚本模式）：每局从脚本随机位置开始，评估用最后 25% 的未训练片段
 .\.venv\Scripts\python.exe tools\research\gap_trainer.py `
     --script .runtime\danmaku\th11_replay_full.json --label reach `

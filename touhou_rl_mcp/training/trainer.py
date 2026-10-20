@@ -27,6 +27,7 @@ import numpy as np
 from ..config import runtime_dir
 from ..types import GameState
 from .features import encode_observation, feature_dim, gap_spec_from, observation_dim
+from .gap_label import update_action_age
 from .journal import Journal
 from .policy import MLPPolicy
 
@@ -140,8 +141,16 @@ class TrainConfig:
     #: TTA 剖面层数。2 = 再拼一层"下一堵墙什么时候到", 大漂移基准上必须开
     #: (第 1 层被眼前这堵墙遮死, 看不到下一堵墙的缺口在哪)
     gap_layers: int = 1
-    #: 缺口老师的标签口径: now / reach / future / slack (见 training/gap_label.py)
+    #: 缺口老师的标签口径: now / reach / future / slack /
+    #: reach_hold / reach_hyst (后两个有状态, 见 training/gap_label.py)
     gap_label: str = "reach"
+    #: 有状态口径的承诺时长 (帧); 0 = 关
+    gap_commit_frames: int = 0
+    #: 有状态口径的滞回阈值 (帧): 新目标必须好这么多才切换; 0 = 关
+    gap_hysteresis: float = 0.0
+    #: 观测里加入"连续同向决策步数" (1 维), 让策略能打破等分缺口的平局
+    gap_action_age: bool = False
+    gap_action_age_cap: int = 12
     #: 基准场景参数 (写进 mock 的弹型对象), 例如 wall_gate 的
     #: ``{"interval": 95, "gap_width": 46, "speed": 2.05, "gap_drift": 0.34}``
     scenario: dict[str, float] = field(default_factory=dict)
@@ -428,6 +437,8 @@ class Trainer:
             or new_config.gap_geo != self.config.gap_geo
             or new_config.gap_clearance != self.config.gap_clearance
             or new_config.gap_prev_action != self.config.gap_prev_action
+            or new_config.gap_action_age != self.config.gap_action_age
+            or new_config.gap_action_age_cap != self.config.gap_action_age_cap
             or new_config.gap_layers != self.config.gap_layers
             or new_config.grid_size != self.config.grid_size
             or new_config.grid_span != self.config.grid_span
@@ -553,7 +564,7 @@ class Trainer:
             state: GameState = result.state
             if getattr(self.env, "backend_name", None) == "memory" and (state.char_main, state.char_sub) != (character, shot):
                 raise ValueError(f"选机失败: 请求 {(character, shot)}, 实际 {(state.char_main, state.char_sub)}")
-            obs = encode_observation(state, config, prev_action=-1)
+            obs = encode_observation(state, config, prev_action=-1, action_age=0)
 
         observations: list[np.ndarray] = []
         actions: list[int] = []
@@ -585,7 +596,9 @@ class Trainer:
             elif teacher in {"gap", "gap_dagger"}:
                 from .gap_teacher import GapTeacher
 
-                guard = GapTeacher(gap_spec_from(config), mode=config.gap_label)
+                guard = GapTeacher(gap_spec_from(config), mode=config.gap_label,
+                                   commit_frames=config.gap_commit_frames,
+                                   hysteresis=config.gap_hysteresis)
         # DAgger: 由**策略自己**驱动游戏(带 beta 概率混入老师动作保证覆盖),
         # 但每步都用老师对其**实际访问到的状态**打标签 -> 修正 BC 的分布漂移。
         # 纯模仿 (guard/rule/gap) 时 beta=1, 完全由老师接管。
@@ -593,6 +606,8 @@ class Trainer:
                        if teacher in {"dagger", "rule_dagger", "gap_dagger"} else 1.0)
         # 记录"上一动作"的方向下标; 缺口观测要靠它表达宏动作的承诺方向
         prev_dir = -1
+        #: 连续同向决策步数 (给观测里的 action_age 维; 推理时同样可从自己的动作算)
+        action_age = 0
 
         # max_steps <= 0 表示不限长; 一局只在真正 game over / clear 时结束
         step_limit = int(config.max_steps) if config.max_steps and config.max_steps > 0 else None
@@ -701,8 +716,12 @@ class Trainer:
 
             # 缺口观测需要"上一动作": 动作表是 [9 快速] + [9 低速] + [... 炸弹],
             # 取模 9 就得到方向下标, 与 occupancy.DIRECTIONS 同序。
-            prev_dir = exec_action % len(DIRECTIONS)
-            obs = encode_observation(state, config, prev_action=prev_dir)
+            next_dir = exec_action % len(DIRECTIONS)
+            action_age = update_action_age(prev_dir, action_age, next_dir,
+                                          config.gap_action_age_cap)
+            prev_dir = next_dir
+            obs = encode_observation(state, config, prev_action=prev_dir,
+                                     action_age=action_age)
 
         if step_limit is not None and record.steps >= step_limit and not (record.cleared or record.game_over):
             record.truncated = True
@@ -733,7 +752,8 @@ class Trainer:
             return record, None
         terminal = bool(record.cleared or record.game_over)
         try:
-            final_obs = encode_observation(state, config, prev_action=prev_dir)
+            final_obs = encode_observation(state, config, prev_action=prev_dir,
+                                           action_age=action_age)
             if terminal:
                 bootstrap = 0.0
             else:

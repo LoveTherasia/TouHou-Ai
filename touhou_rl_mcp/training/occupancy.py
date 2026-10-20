@@ -78,6 +78,11 @@ class GapSpec:
     use_clearance: bool = True
     #: 是否拼接上一动作 one-hot (9 维) —— 策略需要知道自己的动量
     use_prev_action: bool = True
+    #: 是否拼接"连续同向决策步数" (1 维, 0~1)。给策略一个因果可见的承诺记忆:
+    #: 抖动发生在两个几乎等价的缺口之间, 仅有 prev_action 不足以打破平局。
+    use_action_age: bool = False
+    #: 动作年龄的归一化上限 (步); 12 步 = 72 帧
+    action_age_cap: int = 12
 
 
 def _bullets(state: GameState) -> tuple[np.ndarray, np.ndarray]:
@@ -324,6 +329,8 @@ def gap_observation_dim(spec: GapSpec) -> int:
     dim += _globals(GameState(), 0.0, 0.0).shape[0]
     if spec.use_prev_action:
         dim += len(DIRECTIONS)
+    if spec.use_action_age:
+        dim += 1
     return int(dim)
 
 
@@ -344,7 +351,7 @@ class GapObservation:
 
     # ------------------------------------------------------------------
     def __call__(self, state: GameState, prev_action: int = -1,
-                 out: np.ndarray | None = None) -> np.ndarray:
+                 out: np.ndarray | None = None, action_age: int = 0) -> np.ndarray:
         spec = self.spec
         vec = np.empty(self.dim, dtype=np.float64) if out is None else out
         px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
@@ -378,6 +385,11 @@ class GapObservation:
             vec[off:off + 9] = 0.0
             if 0 <= prev_action < 9:
                 vec[off + prev_action] = 1.0
+            off += 9
+        if spec.use_action_age:
+            cap = max(1, int(spec.action_age_cap))
+            vec[off] = min(1.0, max(0.0, float(action_age)) / cap)
+            off += 1
         return vec
 
     # ------------------------------------------------------------------
@@ -391,6 +403,8 @@ class GapObservation:
             "use_grid": s.use_grid,
             "use_geo": s.use_geo,
             "use_clearance": s.use_clearance,
+            "use_action_age": s.use_action_age,
+            "action_age_cap": s.action_age_cap,
         }
 
 

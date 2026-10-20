@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -61,6 +62,44 @@ MACRO_ACTIONS: tuple[str, ...] = (
 SECOND_GAP_FRAMES = 12.0
 
 LABEL_MODES: tuple[str, ...] = ("now", "reach", "future", "slack")
+
+#: 有状态口径: 需要一个 :class:`GapCommitment` 记住"当前目标列"。
+#: 它们不能当成逐帧函数调用 —— 同一帧在不同的承诺状态下标签不同。
+HOLD_MODES: tuple[str, ...] = ("reach_hold", "reach_hyst")
+
+#: 训练/看板可选的完整口径 (逐帧口径 + 有状态口径)
+TEACHER_MODES: tuple[str, ...] = LABEL_MODES + HOLD_MODES
+
+#: 方向 -> 横向符号 (用于"同向连续决策了多少步"这一维观测)
+_LEFT_ACTIONS = frozenset({3, 5, 7})
+_RIGHT_ACTIONS = frozenset({4, 6, 8})
+
+
+def direction_sign(action: int) -> int:
+    """宏动作的横向符号: -1 左 / +1 右 / 0 原地或上下。"""
+    index = int(action) % len(DIRECTIONS)
+    if index in _LEFT_ACTIONS:
+        return -1
+    if index in _RIGHT_ACTIONS:
+        return 1
+    return 0
+
+
+def update_action_age(prev_action: int, age: int, action: int,
+                      cap: int = 12) -> int:
+    """更新"连续同向决策步数"。
+
+    这是给策略的**因果记忆**: 两次决策之间只看 ``prev_action`` 不够, 策略还需要
+    知道"我已经往左走了几步"。抖动发生在两个几乎等价的缺口之间, 这个计数是打破
+    平局所需的唯一历史量, 而且推理时能从自己的动作里算出来, 不需要老师。
+    """
+    sign = direction_sign(action)
+    if sign == 0:
+        return 0
+    if sign == direction_sign(prev_action):
+        return min(max(1, int(cap)), max(0, int(age)) + 1)
+    return 1
+
 
 
 def tta_frames(state: GameState, spec: GapSpec | None = None) -> np.ndarray:
@@ -199,6 +238,125 @@ def slack_label(state: GameState, spec: GapSpec | None = None) -> int:
     return _direction_to(float(centers[k]), px)
 
 
+@dataclass
+class GapCommitment:
+    """有状态的"目标列承诺"。
+
+    为什么必须加这一层
+    ------------------
+    ``reach`` 是单步贪心的: 每一帧都重新问"哪列最空"。当两个缺口的分数只差几帧时,
+    自机往一边挪 6 帧后另一边就反超 —— 标签于是每 6 帧左右互搏一次。实测 18% 的决策
+    在切换动作, 净位移约等于 0。策略忠实地学会了这个抖动 (策略=老师, 逐帧相同),
+    所以修在标签侧。
+
+    两种修法
+    --------
+    * ``reach_hold``: 目标列选定后, ``commit_frames`` 帧内不重算; 只有当前目标
+      快要被弹幕覆盖 (``slack <= safety_margin``) 时才紧急换目标。
+    * ``reach_hyst``: 不放固定时长, 而是要求新目标比当前目标好 ``hysteresis`` 帧
+      才切换 (滞回)。分数按 ``REACH_PAD`` 量化, 避免 1 帧噪声触发换边。
+
+    这是"决策状态", 不是游戏状态: 同一个 ``GameState`` 在不同的承诺状态下会得到
+    不同标签。评估时必须每局新建/重置一个实例, 否则跨局状态会泄漏。
+    """
+
+    spec: GapSpec
+    mode: str = "reach_hold"
+    commit_frames: int = 18
+    hysteresis: float = 10.0
+    safety_margin: float = 0.0
+    target: float | None = None
+    hold_until: int = -1
+    side: int = 0
+    switches: int = 0
+    decisions: int = 0
+
+    def reset(self) -> None:
+        self.target = None
+        self.hold_until = -1
+        self.side = 0
+        self.switches = 0
+        self.decisions = 0
+
+    # ------------------------------------------------------------------
+    def _slack(self, state: GameState) -> tuple[np.ndarray, np.ndarray, float]:
+        tta = tta_frames(state, self.spec)
+        centers = _column_centers(self.spec)
+        px = _player_x(state)
+        travel = np.abs(centers - px) / PLAYER_SPEED
+        return centers, tta - travel, px
+
+    @staticmethod
+    def _nearest(centers: np.ndarray, x: float) -> int:
+        return int(np.argmin(np.abs(centers - x)))
+
+    def decide(self, state: GameState, frame: int | None = None) -> tuple[int, dict]:
+        """返回 ``(动作下标, 诊断信息)``。"""
+        centers, slack, px = self._slack(state)
+        if slack.size == 0 or not np.any(slack > 0):
+            return 0, {"target": None, "switched": False, "reason": "no_bullets"}
+
+        padded = np.floor(slack / REACH_PAD) * REACH_PAD
+        best = float(padded.max())
+        tied = np.flatnonzero(padded >= best - 1e-9)
+        best_idx = int(tied[np.argmin(np.abs(centers[tied] - px))])
+
+        tick = int(frame) if frame is not None else self.decisions
+        self.decisions += 1
+        switched = False
+        reason = "hold"
+
+        if self.target is None:
+            self.target = float(centers[best_idx])
+            self.hold_until = tick + max(0, int(self.commit_frames))
+            self.side = (1 if self.target > px else -1 if self.target < px else 0)
+            switched = True
+            reason = "init"
+        else:
+            current_idx = self._nearest(centers, self.target)
+            current = float(slack[current_idx])
+            unsafe = current <= float(self.safety_margin)
+            if unsafe:
+                new_idx = best_idx
+                reason = "unsafe"
+            elif self.mode == "reach_hyst":
+                better = best > float(padded[current_idx]) + float(self.hysteresis)
+                new_idx = best_idx if better else current_idx
+                reason = "hysteresis" if better else "hold"
+            elif tick < self.hold_until:
+                new_idx = current_idx
+                reason = "hold"
+            else:
+                new_idx = best_idx
+                reason = "expired"
+
+            if new_idx != current_idx:
+                self.target = float(centers[new_idx])
+                self.hold_until = tick + max(0, int(self.commit_frames))
+                self.side = (1 if self.target > px else -1 if self.target < px else 0)
+                switched = True
+                self.switches += 1
+            # 目标没变时**不重置**承诺计时: 承诺窗口从"上次换目标"开始算,
+            # 否则每帧顺延会变成永远不换 (滑窗), 等于没有承诺。
+
+        action = _direction_to(self.target, px)
+        # 已经走到/越过目标列就停下, 不要为了回正而反向 —— 6 帧一步走 26px,
+        # 不处理越界会在目标两侧来回摆, 把"承诺"变成新的抖动来源。
+        delta = float(self.target) - px
+        if self.side and delta * self.side <= 10.0:
+            action = 0
+        return action, {
+            "target": self.target,
+            "side": self.side,
+            "switched": switched,
+            "reason": reason,
+            "best_score": best,
+            "hold_until": self.hold_until,
+            "decisions": self.decisions,
+            "switches": self.switches,
+        }
+
+
 #: 口径 -> 实现 (``gap_label`` 的分发表; 加口径只改这里)
 _LABELS = {
     "now": now_label,
@@ -210,20 +368,31 @@ _LABELS = {
 
 def gap_label(state: GameState, spec: GapSpec | None = None,
               mode: str = "reach") -> int:
-    """把一个状态打上宏动作标签 (0~8, 与 :data:`MACRO_ACTIONS` 同序)。"""
+    """把一个状态打上宏动作标签 (0~8, 与 :data:`MACRO_ACTIONS` 同序)。
+
+    ``reach_hold`` / ``reach_hyst`` 是**有状态**口径, 同一帧在不同承诺状态下标签
+    不同, 不能逐帧调用 —— 请用 :class:`GapCommitment` / ``GapTeacher``。
+    """
     try:
         fn = _LABELS[mode]
     except KeyError:
-        raise KeyError(f"未知标签口径: {mode!r}; 可用: {', '.join(LABEL_MODES)}") from None
+        raise KeyError(
+            f"未知的逐帧标签口径: {mode!r}; 可用: {', '.join(LABEL_MODES)}; "
+            f"有状态口径 {', '.join(HOLD_MODES)} 请用 GapCommitment"
+        ) from None
     return int(fn(state, spec))
 
 
 __all__ = [
     "COMMIT_FRAMES",
+    "GapCommitment",
+    "HOLD_MODES",
     "LABEL_MODES",
     "MACRO_ACTIONS",
     "REACH_PAD",
     "SECOND_GAP_FRAMES",
+    "TEACHER_MODES",
+    "direction_sign",
     "future_label",
     "gap_label",
     "macro_x",
@@ -232,4 +401,5 @@ __all__ = [
     "reach_target",
     "slack_label",
     "tta_frames",
+    "update_action_age",
 ]
