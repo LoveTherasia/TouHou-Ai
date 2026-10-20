@@ -14,7 +14,7 @@
 
 | 项 | 结果 |
 |---|---|
-| 单元/集成测试 | `python -m unittest discover -s tests` → **170 个用例，168 通过 / 2 跳过**，约 15 s |
+| 单元/集成测试 | `python -m unittest discover -s tests` → **172 个用例，170 通过 / 2 跳过**，约 12 s |
 | 自检 | `python -m touhou_rl_mcp selftest --dodge --steps 200` → 正常出图 |
 | MCP 工具 | **30 个** `th_*`（server.py） |
 | 源码规模 | 约 2.07 万行（库 + tools + tests + native + docs） |
@@ -185,6 +185,23 @@ BC → DAgger → PPO。过程中修掉三个会改变结论的 bug（观测缓�
 都更差；"少抖"（反向率降到 1.1%）不等于"活得久"。P1 第一版方向对、幅度小，下一步应做
 **receding horizon 标签 + 把当前目标列显式放进观测**，而不是继续调承诺长度。
 完整数据见 [`docs/GAP_LEARNING.md`](GAP_LEARNING.md)。
+
+#### P2 缺口学习 · 六（2026-10-20，斜向单弹 TTA 修复）
+
+GIF 暴露了一个观测 bug：**斜着朝自机飞来的单颗弹会被标到相邻车道**，自机所在车道
+显示"安全"（t1=243），`reach` 标签返回原地，于是站着被撞。
+
+- 根因：`_arrival_times` 取"弹幕刚进入 ±26px 高度带"时的 x；斜弹穿过 52px 高度带
+  会横移十几像素（45° 正好 4 条车道），标记的是弹幕上方的位置。
+- 修复：取 `argmin |y(t) - player_y|`（穿过自机高度那一帧）的 x 标记车道；
+  `tests/test_occupancy.py` / `tests/test_gap_label.py` 各加一个回归用例。
+- 合成验证：单颗斜弹从"标签=原地"变为"左/右"。
+- `tools/research/aimed_probe.py` 新增单颗斜向自狙探针：旧策略 468 帧，重训 seed 7
+  2022 帧；但 seed 17 / 27 仍只有 762 / 468 帧。
+- 脚本 test（修复后 3 seeds）：基线均值 2170，`reach_hold` 18 帧均值 **2260**。
+
+**结论：观测 bug 已修，但"单颗自机狙"的稳定躲避还没有解决**——它取决于策略学到的
+行为，下一步应把 `aimed_single` 这类弹型放进训练分布，而不是只调观测。
 
 ### P3 · 真机与多作品
 

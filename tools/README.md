@@ -15,6 +15,7 @@
 | `research/gap_diagnose.py` | 把失败局拆开：死在**哪一堵墙**、赶路来不来得及、最后 30 帧有没有朝缺口走 |
 | `research/gap_gif.py` | 训练好的策略放回 v3 场景跑，输出 GIF + 自机/缺口横向轨迹图 |
 | `research/gap_report.py` | 存活饱和时改看"飞行方式"（擦弹、最近弹距、横移占比） |
+| `research/aimed_probe.py` | 单颗斜向自机狙探针：检查策略是否把"自机所在车道"误判成安全 |
 | `research/gap_benchmark.py` | 避弹基准：站着不动 vs 斥力老师 vs 时空规划器 |
 
 ```powershell
@@ -60,6 +61,12 @@
 # 指定脚本片段（默认优先读 run 的 test_fracs）；新策略会带上 action_age
 .\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\gif-hold18 --last `
     --fracs 0.71,0.89 --all
+
+# 单颗斜向自机狙探针（检查"自机所在车道是否被误判成安全"）
+.\.venv\Scripts\python.exe tools\research\aimed_probe.py `
+    --run .runtime\runs\gif-aimfix --seeds 11,17,23
+.\.venv\Scripts\python.exe tools\research\aimed_probe.py `
+    --run .runtime\runs\gif-aimfix --seeds 17 --gif
 ```
 
 ## train — 训练入口

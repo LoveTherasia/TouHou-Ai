@@ -235,5 +235,21 @@ class ActionAgeTest(unittest.TestCase):
         self.assertTrue(new.gap_action_age)
 
 
+class DiagonalAimTest(unittest.TestCase):
+    """斜着朝自机飞来的单颗弹, 必须标记自机所在车道, 而不是它"刚进带"的车道。"""
+
+    def test_player_lane_is_threatened(self) -> None:
+        state = GameState(
+            frame=100, in_game=True, player_x=192.0, player_y=416.0,
+            bullets=[(100.0, 100.0)],
+            raw={"bullet_velocity": [(0.69, 2.38)]},  # 从 (100,100) 指向 (192,416)
+        )
+        spec = GapSpec(use_grid=False, use_geo=True, use_clearance=False)
+        col = int(192.0 / (384.0 / spec.tta_cols))
+        profile = _tta_profile(416.0, *_bullets(state), spec)
+        # 修复前: 取"刚进入 ±26px 高度带"的 x≈184 -> 自机所在列显示安全 (1.0)
+        self.assertLess(float(profile[col]), 0.9)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ import numpy as np
 
 from touhou_rl_mcp.training.gap_label import (
     LABEL_MODES, MACRO_ACTIONS, SECOND_GAP_FRAMES, TEACHER_MODES,
-    GapCommitment, gap_label, reach_target, slack_label, tta_frames,
+    GapCommitment, gap_label, reach_label, reach_target, slack_label, tta_frames,
     update_action_age,
 )
 from touhou_rl_mcp.training.gap_teacher import GapTeacher
@@ -149,6 +149,21 @@ class SlackDwellTest(unittest.TestCase):
         self.assertTrue(covered.size)
         col = int(covered[0])
         self.assertGreaterEqual(t2[col] - t1[col], SECOND_GAP_FRAMES - 1e-9)
+
+
+class DiagonalAimLabelTest(unittest.TestCase):
+    def test_diagonal_aimed_bullet_is_not_ignored(self) -> None:
+        # 从 (100,100) 斜着飞向 (192,416): 自机所在列必须被标成受威胁
+        state = GameState(
+            frame=100, in_game=True, player_x=192.0, player_y=416.0,
+            bullets=[(100.0, 100.0)],
+            raw={"bullet_velocity": [(0.69, 2.38)]},
+        )
+        spec = GapSpec()
+        tta = tta_frames(state, spec)
+        col = int(192.0 / (PLAYFIELD_WIDTH / spec.tta_cols))
+        self.assertLess(float(tta[col]), float(spec.tta_horizon))
+        self.assertNotEqual(reach_label(state, spec), 0)
 
 
 class CommitmentTest(unittest.TestCase):

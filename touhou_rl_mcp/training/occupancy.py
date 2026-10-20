@@ -156,18 +156,25 @@ def _arrival_times(py: float, pos: np.ndarray, vel: np.ndarray,
     ts = np.arange(0, spec.tta_horizon + 1, spec.tta_step, dtype=np.float64)
     xs = pos[:, 0][None, :] + vel[:, 0][None, :] * ts[:, None]
     ys = pos[:, 1][None, :] + vel[:, 1][None, :] * ts[:, None]
-    hot = (np.abs(ys - py) <= spec.tta_band) & (xs >= -reach) & \
-          (xs <= PLAYFIELD_WIDTH + reach)
-    if not np.any(hot):
-        return t1, t2
-
-    valid = hot.any(axis=0)
+    # **用"最接近自机高度"的时刻, 而不是"刚进入高度带"的时刻。**
+    #
+    # 斜着飞来的弹在穿过 ±tta_band 的 52px 高度带时, x 会横向移动十几像素
+    # (45° 时正好 52px ≈ 4 条车道)。若取"刚进带"的 x, 标记的是弹幕**上方**的
+    # 位置, 而不是它到达自机高度时的位置 —— 正对着自机来的单颗斜弹会被标到
+    # 相邻车道, 自机所在车道反而显示"安全", 策略于是呆在原地被撞。
+    # 取 |y-py| 最小的时刻, 就是弹道穿过自机高度的那一帧。
+    dy = np.abs(ys - py)
+    closest = np.argmin(dy, axis=0)
+    cols_index = np.arange(pos.shape[0])
+    min_dy = dy[closest, cols_index]
+    x_at = xs[closest, cols_index]
+    valid = (min_dy <= spec.tta_band) & (x_at >= -reach) & \
+            (x_at <= PLAYFIELD_WIDTH + reach)
     if not np.any(valid):
         return t1, t2
     idx = np.flatnonzero(valid)
-    first = np.argmax(hot, axis=0)[idx]     # 每颗弹首次进入带宽的时刻下标
-    t_first = ts[first]
-    x_first = xs[first, idx]
+    t_first = ts[closest[idx]]
+    x_first = x_at[idx]
     # **按车道区间与危险区是否相交**来判定, 而不是"车道中心是否落在危险区内"。
     #
     # 这条是踩过的坑: 车道 12px、判定半径 5px, 中心只覆盖 10px。—— 一颗落在两个
