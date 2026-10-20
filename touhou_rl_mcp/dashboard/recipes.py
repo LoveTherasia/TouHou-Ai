@@ -215,6 +215,41 @@ RECIPES: dict[str, Recipe] = {
                 Param("seed", "随机种子", "int", 7, 0, 999999),
             ),
         ),
+        Recipe(
+            id="gap_script",
+            name="缺口学习 · 真机录制的弹幕",
+            description=("不用合成弹幕墙, 改用**真机录制的弹幕脚本**回放: 每局从脚本随机位置开始, "
+                         "评估用最后 25% 的未训练片段。适合验证合成基准上的结论在真实弹幕上成不成立。"),
+            script="tools/research/gap_trainer.py",
+            name_params=("label", "arm"),
+            params=(
+                Param("script", "弹幕脚本", "choice",
+                      ".runtime/danmaku/th11_replay_full.json",
+                      choices=(".runtime/danmaku/th11_replay_full.json",
+                               ".runtime/danmaku/th11_stage1_long.json",
+                               ".runtime/danmaku/th11_stage1.json"),
+                      help="th11_replay_full = 整局回放 (10 万帧, 站桩会被打死); "
+                           "stage1_long = 第一面加长版 (站桩大多能活, 只适合看动作)"),
+                Param("arm", "观测", "choice", "geo", choices=("geo", "grid", "both")),
+                Param("label", "弱监督标签", "choice", "reach",
+                      choices=("now", "reach", "future", "slack")),
+                Param("reward", "奖励", "choice", "gap_survive",
+                      choices=("gap_survive", "default")),
+                Param("kl_anchor", "RL 的 KL 锚", "float", 1.0, 0.0, 20.0,
+                      help="脚本模式下 RL 更容易冲掉监督学到的感知, 建议保持 > 0"),
+                Param("bc_episodes", "BC 局数", "int", 60, 0, 2000),
+                Param("dagger_episodes", "DAgger 局数", "int", 100, 0, 2000),
+                Param("rl_episodes", "PPO 局数", "int", 0, 0, 5000,
+                      help="脚本模式默认不跑 RL (实测只会持平或略降)"),
+                Param("script_eval", "评估片段", "choice", "0.80,0.87,0.94",
+                      choices=("0.80,0.87,0.94", "0.85,0.92", "0.90"),
+                      help="逗号分隔的脚本位置比例; 必须在训练区间 [0, 0.75] 之外"),
+                Param("batch", "每 N 局更新一次", "int", 4, 1, 64),
+                Param("eval_every", "每 N 局评估一次", "int", 20, 1, 500),
+                Param("max_frames", "单局上限 (帧)", "int", 2400, 300, 30000),
+                Param("seed", "随机种子", "int", 7, 0, 999999),
+            ),
+        ),
     )
 }
 

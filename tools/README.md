@@ -23,12 +23,18 @@
     --bc-episodes 60 --dagger-episodes 100 --rl-episodes 120 `
     --eval-every 20 --eval-phases 3 --rand --kl-anchor 1.0
 
+# 真机录制的弹幕（脚本模式）：每局从脚本随机位置开始，评估用最后 25% 的未训练片段
+.\.venv\Scripts\python.exe tools\research\gap_trainer.py `
+    --script .runtime\danmaku\th11_replay_full.json --label reach `
+    --bc-episodes 60 --dagger-episodes 100 --kl-anchor 1.0
+
 # 失败诊断：每一局死在哪、来不来得及
 .\.venv\Scripts\python.exe tools\research\gap_diagnose.py --run .runtime\runs\v3-anchor1
 .\.venv\Scripts\python.exe tools\research\gap_diagnose.py --run .runtime\runs\v3-anchor1 --teacher
 
-# 看它怎么飞（9 局 GIF + 轨迹）
+# 看它怎么飞（GIF + 轨迹；默认优先用按评估择优的 policy_best）
 .\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\v3-anchor1 --all
+.\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\script-best --all
 ```
 
 ## train — 训练入口

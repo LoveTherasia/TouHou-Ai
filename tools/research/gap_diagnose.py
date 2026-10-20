@@ -46,9 +46,10 @@ from touhou_rl_mcp.types import PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH  # noqa: E402
 WALL_TRAVEL_DEFAULT = (PLAYFIELD_HEIGHT - 32 - 108.0)
 
 
-def load_run(run_dir: Path) -> tuple[MLPPolicy, dict[str, Any]]:
-    meta = json.loads((run_dir / "policy.json").read_text(encoding="utf-8"))
-    policy = MLPPolicy.load(run_dir / "policy.npz")
+def load_run(run_dir: Path, name: str = "policy") -> tuple[MLPPolicy, dict[str, Any]]:
+    """``name`` 可选 ``policy`` / ``policy_best`` (训练脚本按评估择优保存的那份)。"""
+    meta = json.loads((run_dir / f"{name}.json").read_text(encoding="utf-8"))
+    policy = MLPPolicy.load(run_dir / f"{name}.npz")
     return policy, meta
 
 

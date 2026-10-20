@@ -130,6 +130,18 @@ class TestTrainer(unittest.TestCase):
 class TestGapObservationInTrainer(unittest.TestCase):
     """缺口观测 / 缺口老师 / 基准场景接入 Trainer 的契约。"""
 
+    def test_script_offset_range_survives_serialization(self) -> None:
+        """真机弹幕脚本的随机起点必须写进 policy.json。
+
+        这是脚本模式下**唯一**的训练多样性来源: 序列化丢了它, 每局都会从脚本开头
+        开始 (同一段弹幕重复 N 次), 而训练日志上完全看不出来。
+        """
+        cfg = TrainConfig(use_gap=True, script_offset_range=[0.0, 0.75])
+        back = TrainConfig.from_dict(cfg.to_dict())
+        self.assertEqual(back.script_offset_range, [0.0, 0.75])
+        # 默认 (合成基准) 不带偏移区间, 免得误改 mock 的 danmaku_offset
+        self.assertEqual(TrainConfig().script_offset_range, [])
+
     def test_observation_dim_matches_the_encoder(self) -> None:
         from touhou_rl_mcp.training.features import (
             encode_observation, gap_spec_from, observation_dim,

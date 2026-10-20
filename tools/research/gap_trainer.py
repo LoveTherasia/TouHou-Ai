@@ -83,22 +83,43 @@ def random_ranges(base: dict[str, float]) -> dict[str, list[float]]:
 
 
 # ----------------------------------------------------------------------
-def build_env(scenario: dict[str, float], reward: dict[str, float]) -> TouhouEnv:
+def build_env(scenario: dict[str, float], reward: dict[str, float],
+              script: str = "") -> TouhouEnv:
     cfg = Config.load()
-    cfg.patch({
+    patch: dict[str, Any] = {
         "backend": "mock",
         "game": "th11",
-        "danmaku_pattern": "wall_gate",
+        "danmaku_pattern": "" if script else "wall_gate",
         "step_frames": COMMIT_FRAMES,
         "max_episode_frames": 0,        # 只按 game over 结束 (基准要靠存活帧数比较)
         "auto_reset": False,
         "reward": reward,
-    })
+    }
+    if script:
+        patch["danmaku_script"] = script
+    cfg.patch(patch)
     env = TouhouEnv(cfg)
     env.start()
     env.reset(seed=1)
-    apply_scenario(env, scenario)
+    if script:
+        apply_script_offset(env, 0.0)
+    else:
+        apply_scenario(env, scenario)
     return env
+
+
+def script_length(env: TouhouEnv) -> int:
+    script = getattr(getattr(env, "backend", None), "_script", None) or {}
+    return int(script.get("length") or 0)
+
+
+def apply_script_offset(env: TouhouEnv, fraction: float) -> None:
+    """把脚本起点设到 ``fraction`` 处 (0~1)。必须在 reset **之前**设, reset 会读它。"""
+    length = script_length(env)
+    if length <= 0:
+        return
+    #: 显式 int: 某些后端把配置值原样拿去取模, 浮点会静默失效
+    env.backend.config.patch({"danmaku_offset": int(round(fraction * length))})
 
 
 def make_trainer(env: TouhouEnv, args: argparse.Namespace,
@@ -123,8 +144,10 @@ def make_trainer(env: TouhouEnv, args: argparse.Namespace,
         scenario=dict(scenario),
         # 缺口相位每局重采: 否则 2400 帧的基准退化成"同一个局面重复 N 次"
         # --rand 再把间隔/弹速/缺口宽度/漂移方向一起张开 (域随机化)
-        scenario_random=(random_ranges(scenario) if args.rand
-                         else {"gap_phase": [0.0, 1.0]}),
+        scenario_random=(random_ranges(scenario) if args.rand else
+                         ({"gap_phase": [0.0, 1.0]} if scenario else {})),
+        # 脚本模式: 每局从录制的不同位置开始 (脚本会循环, 这是唯一的多样性来源)
+        script_offset_range=list(args.script_train_range) if args.script else [],
         teacher=teacher,
         dagger_beta=args.dagger_beta,
         teacher_epochs=args.teacher_epochs,
@@ -188,6 +211,42 @@ def evaluate(env: TouhouEnv, trainer: Trainer,
     }
 
 
+def evaluate_script(env: TouhouEnv, trainer: Trainer, fractions: tuple[float, ...],
+                    *, max_frames: int, label_mode: str) -> dict[str, Any]:
+    """在**没训练过的脚本片段**上贪心跑 (真假弹幕模式的评估)。"""
+    enc = gap_encoder(trainer.config)
+    spec = gap_spec_from(trainer.config)
+    frames: list[int] = []
+    agree: list[float] = []
+    for frac in fractions:
+        apply_script_offset(env, float(frac))
+        state = env.reset(seed=101).state
+        survival = 0
+        prev = -1
+        hits = total = 0
+        while survival < max_frames:
+            obs = enc(state, prev_action=prev)
+            with trainer.policy_lock:
+                action = int(trainer.policy.greedy(obs))
+            hits += int(action == gap_label(state, spec, label_mode))
+            total += 1
+            result = env.step(MACRO_ACTIONS[action], frames=COMMIT_FRAMES,
+                              auto_reset=False)
+            state = result.state
+            survival += COMMIT_FRAMES
+            prev = action
+            if result.done:
+                break
+        frames.append(survival)
+        agree.append(hits / total if total else 0.0)
+    return {
+        "frames": frames,
+        "mean": float(np.mean(frames)) if frames else 0.0,
+        "min": float(np.min(frames)) if frames else 0.0,
+        "agree": float(np.mean(agree)) if agree else 0.0,
+    }
+
+
 def run_chunk(trainer: Trainer, target_episodes: int) -> None:
     """把训练器跑到 ``target_episodes`` 局为止 (到点自己停线程)。"""
     trainer.config.episodes = int(target_episodes)
@@ -219,6 +278,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="v2 缺口基准 · 正式训练链路")
     ap.add_argument("--arm", choices=tuple(ARMS), default="geo", help="观测口径")
     ap.add_argument("--bench", choices=tuple(BENCHMARKS), default="v2")
+    ap.add_argument("--script", default="",
+                    help="改用**真机录制的弹幕脚本** (如 .runtime/danmaku/th11_stage1_long.json)。"
+                         "给了它就不再用 wall_gate 合成基准, 每局从脚本随机位置开始")
+    ap.add_argument("--script-train-range", type=float, nargs=2, default=[0.0, 0.75],
+                    metavar=("LO", "HI"),
+                    help="训练可用的脚本区间 (占长度比例); 默认把最后 25%% 留作未见片段")
+    ap.add_argument("--script-eval", default="0.80,0.87,0.94",
+                    help="评估用的脚本位置 (逗号分隔比例), 应当在训练区间之外")
     ap.add_argument("--label", choices=LABEL_MODES, default="slack",
                     help="弱监督标签口径 (now/reach/future/slack)")
     ap.add_argument("--reward", default="gap_survive",
@@ -262,36 +329,51 @@ def main() -> int:
                     help="训练记录目录 (默认 .runtime/runs/<...>; 看板可直接读取)")
     args = ap.parse_args()
 
-    train_scenario, heldout = BENCHMARKS[args.bench]
+    if args.script:
+        train_scenario, heldout = {}, ()
+        eval_fracs = tuple(float(x) for x in args.script_eval.split(",") if x.strip())
+    else:
+        train_scenario, heldout = BENCHMARKS[args.bench]
+        eval_fracs = ()
     # ``--reward default`` = 不动奖励 (用 config.json 里那套危险度惩罚), 作为对照组
     reward = {} if args.reward == "default" else reward_profile(args.reward)
     if args.gap_margin:
         reward["gap_margin_scale"] = float(args.gap_margin)
 
+    stem = Path(args.script).stem if args.script else args.bench
     out_dir = Path(args.run_dir) if args.run_dir else (
         runtime_dir() / "runs" /
-        f"trainer-{args.bench}-{args.label}-{args.arm}-{time.strftime('%Y%m%d-%H%M%S')}")
+        f"trainer-{stem}-{args.label}-{args.arm}-{time.strftime('%Y%m%d-%H%M%S')}")
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_path = out_dir / "eval.jsonl"
 
-    env = build_env(train_scenario, reward)
+    env = build_env(train_scenario, reward, script=args.script)
     trainer = make_trainer(env, args, train_scenario, teacher="", out_dir=out_dir)
 
-    print(f"bench={args.bench}  label={args.label}  arm={args.arm}  "
+    where = f"script={args.script}" if args.script else f"bench={args.bench}"
+    print(f"{where}  label={args.label}  arm={args.arm}  "
           f"reward={args.reward}  gap_margin={args.gap_margin}  rand={args.rand}")
     print(f"obs_dim={trainer.obs_dim}  actions={len(trainer.action_table)}  "
           f"run={out_dir}")
-    print(f"train scenario: {train_scenario}")
-    if args.rand:
-        print(f"train ranges: {random_ranges(train_scenario)}")
+    if args.script:
+        print(f"脚本长度 {script_length(env)} 帧, 训练区间 {args.script_train_range}, "
+              f"留出片段 {eval_fracs}")
+    else:
+        print(f"train scenario: {train_scenario}")
+        if args.rand:
+            print(f"train ranges: {random_ranges(train_scenario)}")
 
     meta: dict[str, Any] = {
         "script": "tools/research/gap_trainer.py",
-        "bench": args.bench, "label": args.label, "arm": args.arm,
+        "bench": ("script" if args.script else args.bench),
+        "danmaku_script": str(args.script or ""),
+        "eval_fracs": list(eval_fracs),
+        "label": args.label, "arm": args.arm,
         "reward": args.reward, "gap_margin": args.gap_margin,
         "rand": bool(args.rand),
-        "train_ranges": (random_ranges(train_scenario) if args.rand
-                         else {"gap_phase": [0.0, 1.0]}),
+        "train_ranges": ([list(args.script_train_range)] if args.script else
+                         (random_ranges(train_scenario) if args.rand
+                          else {"gap_phase": [0.0, 1.0]})),
         "obs_dim": trainer.obs_dim,
         "train_scenario": train_scenario,
         "heldout": [dict(s) for s in heldout],
@@ -311,12 +393,23 @@ def main() -> int:
     phase_offsets = tuple(
         i / max(1, args.eval_phases) for i in range(max(1, args.eval_phases)))
 
+    best = {"mean": -1.0, "step": 0, "tag": ""}
+
     def eval_and_log(tag: str) -> dict[str, Any]:
-        result = evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                          label_mode=args.label, phases=phase_offsets)
+        if args.script:
+            result = evaluate_script(env, trainer, eval_fracs,
+                                     max_frames=args.max_frames, label_mode=args.label)
+        else:
+            result = evaluate(env, trainer, heldout, max_frames=args.max_frames,
+                              label_mode=args.label, phases=phase_offsets)
         _write_row(eval_path, step_index(), tag, result["mean"], result["frames"],
                    agree=round(result["agree"], 4),
                    min_frames=round(result["min"], 1))
+        # 逐段择优: 训练只覆盖"最后一版"会丢掉中途更好的权重 (脚本模式实测
+        # 2218 -> 1992 的回落), 而评估是唯一可信的选型依据。
+        if result["mean"] > best["mean"]:
+            best.update(mean=result["mean"], step=step_index(), tag=tag)
+            trainer.save(out_dir / "policy_best")
         print(f"  [{tag}] {_fmt(result)}", flush=True)
         return result
 
@@ -361,14 +454,21 @@ def main() -> int:
     if not trainer.episodes:
         eval_and_log("untrained")
     trainer.save()
-    final = evaluate(env, trainer, heldout, max_frames=args.max_frames,
-                     label_mode=args.label, phases=phase_offsets)
+    final = (evaluate_script(env, trainer, eval_fracs, max_frames=args.max_frames,
+                             label_mode=args.label)
+             if args.script else
+             evaluate(env, trainer, heldout, max_frames=args.max_frames,
+                      label_mode=args.label, phases=phase_offsets))
+    meta["best"] = {"mean_frames": round(best["mean"], 1),
+                    "step": best["step"], "phase": best["tag"]}
     meta["final"] = {"mean_frames": round(final["mean"], 1),
                      "min_frames": round(final["min"], 1),
                      "agree": round(final["agree"], 4),
                      "detail": [int(x) for x in final["frames"]]}
     flush_meta()
     print(f"\n最终: {_fmt(final)}")
+    print(f"最好的一版: {best['mean']:.0f} 帧 (step {best['step']}, {best['tag']}) "
+          f"-> {out_dir / 'policy_best.npz'}")
     env.close()
     return 0
 

@@ -149,6 +149,9 @@ class TrainConfig:
     #: 例如 ``{"gap_phase": [0.0, 1.0]}`` —— 不加它, wall_gate 每局的缺口相位都一样,
     #: 训练集退化成"同一个局面重复 N 次", 策略只会背下那一个相位。
     scenario_random: dict[str, list[float]] = field(default_factory=dict)
+    #: 真机弹幕脚本的起始位置区间 (占脚本长度的比例), 例如 ``[0.0, 1.0]``。
+    #: 脚本会循环, 所以这是脚本模式下训练多样性的**唯一**来源; 空 = 固定在 0。
+    script_offset_range: list[float] = field(default_factory=list)
     #: 危险图边长 (格数); 观测维度 = grid_size^2 * (1 或 3) + 全局特征
     grid_size: int = 16
     #: 危险图半径 (像素): 覆盖自机周围 ±grid_span
@@ -510,6 +513,26 @@ class Trainer:
             finally:
                 self.finished_at = time.perf_counter()
 
+    def _apply_script_offset(self, config: "TrainConfig") -> None:
+        """真机弹幕脚本模式: 每局从脚本的随机位置开始。
+
+        脚本是**可以循环**的 (``frame % length``), 所以"从哪个位置开始"就是全部的训练
+        多样性来源。固定 offset 的话, 每局都是同一段弹幕重复 —— 和 wall_gate 固定相位
+        是同一个坑。偏移通过后端 config 注入, 因为 ``MockBackend.reset`` 每次都读
+        ``danmaku_offset`` 重建 MockGame。
+        """
+        bounds = getattr(config, "script_offset_range", None) or []
+        if len(bounds) < 2:
+            return
+        backend = getattr(self.env, "backend", None)
+        script = getattr(backend, "_script", None) or {}
+        length = int(script.get("length") or 0)
+        cfg = getattr(backend, "config", None)
+        if length <= 0 or cfg is None:
+            return
+        lo, hi = float(bounds[0]), float(bounds[1])
+        cfg.patch({"danmaku_offset": int(self._rng.uniform(lo, hi) * length)})
+
     def _run_episode(
         self, index: int, *, greedy: bool = False
     ) -> tuple[EpisodeRecord, "Trajectory" | None]:
@@ -517,6 +540,7 @@ class Trainer:
         character, shot = (divmod((index-1) % 6, 3) if config.rotate_loadouts
                            else (config.character, config.shot))
         with self.env_lock:
+            self._apply_script_offset(config)
             result = self.env.reset(seed=config.seed + index, difficulty=config.difficulty,
                                     character=character, shot=shot,
                                     start_stage=config.start_stage)
