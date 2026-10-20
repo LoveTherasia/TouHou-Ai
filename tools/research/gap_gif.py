@@ -32,7 +32,7 @@ from gap_trainer import apply_script_offset, build_env as build_script_env  # no
 from touhou_rl_mcp.capture.visualize import _font  # noqa: E402
 from touhou_rl_mcp.training.features import ObservationEncoder  # noqa: E402
 from touhou_rl_mcp.training.features import gap_spec_from  # noqa: E402
-from touhou_rl_mcp.training.gap_label import COMMIT_FRAMES  # noqa: E402
+from touhou_rl_mcp.training.gap_label import COMMIT_FRAMES, update_action_age  # noqa: E402
 from touhou_rl_mcp.training.occupancy import (  # noqa: E402
     PLAYER_SPEED, _bullets, _column_centers, _tta_profile,
 )
@@ -87,6 +87,8 @@ def main() -> int:
     ap.add_argument("--phases", type=int, default=3, help="相位偏移总数 (与评估一致)")
     ap.add_argument("--all", action="store_true", help="跑全部 场景×相位 (或全部留出片段)")
     ap.add_argument("--max-frames", type=int, default=2400)
+    ap.add_argument("--fracs", default="",
+                    help="脚本模式的评估位置 (逗号分隔); 默认优先用 run 的 test_fracs")
     ap.add_argument("--stride", type=int, default=2, help="每 N 个宏动作抓一帧")
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--width", type=int, default=360)
@@ -116,8 +118,13 @@ def main() -> int:
 
     if script:                                  # 真机弹幕脚本模式
         env = build_script_env({}, {}, script=script)
-        fracs = [float(x) for x in (run_meta.get("eval_fracs")
-                                    or [0.80, 0.87, 0.94])]
+        if args.fracs:
+            fracs = [float(x) for x in args.fracs.split(",") if x.strip()]
+        else:
+            # P0 之后新 run 分开写 dev/test; 默认看 test (没参与选权重)
+            fracs = [float(x) for x in (run_meta.get("test_fracs")
+                                        or run_meta.get("eval_fracs")
+                                        or [0.80, 0.87, 0.94])]
         jobs = ([(i, f) for i, f in enumerate(fracs)] if args.all
                 else [(0, fracs[min(args.scene, len(fracs) - 1)])])
     else:                                       # wall_gate 合成基准
@@ -152,16 +159,19 @@ def main() -> int:
         frames: list[Image.Image] = []
         rows: list[dict[str, Any]] = []
         prev = -1
+        age = 0
+        cap = int(cfg.get("gap_action_age_cap", 12) or 12)
         total = 0
         for i in range(args.max_frames // COMMIT_FRAMES):
             rows.append({"frame": int(st.frame), "px": float(st.player_x),
                          "gap": target_x(st)})
             if i % args.stride == 0:
                 frames.append(env.capture_frame())
-            obs = enc(st, prev_action=prev)
+            obs = enc(st, prev_action=prev, action_age=age)
             a = int(policy.greedy(obs))
             res = env.step(actions[a], frames=COMMIT_FRAMES, auto_reset=False)
             st = res.state
+            age = update_action_age(prev, age, a, cap)
             prev = a
             total += COMMIT_FRAMES
             if res.done:

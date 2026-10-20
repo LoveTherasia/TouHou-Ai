@@ -57,6 +57,9 @@
 # 看它怎么飞（GIF + 轨迹；默认优先用按评估择优的 policy_best）
 .\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\v3-anchor1 --all
 .\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\script-best --all
+# 指定脚本片段（默认优先读 run 的 test_fracs）；新策略会带上 action_age
+.\.venv\Scripts\python.exe tools\research\gap_gif.py --run .runtime\runs\gif-hold18 --last `
+    --fracs 0.71,0.89 --all
 ```
 
 ## train — 训练入口

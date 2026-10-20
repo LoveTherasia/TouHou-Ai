@@ -539,6 +539,20 @@ test  0.59, 0.65, 0.71, 0.77, 0.83, 0.89, 0.95          (7 段, 只报一次)
 解决"策略=老师"的天花板。下一步应做的是**带推演的标签（receding horizon）**，
 以及把"当前目标列"显式放进观测，而不是继续调承诺长度。
 
+### GIF 检验：`gif-hold18`
+
+用当前最好配方重跑一局（60 BC + 100 DAgger + 60 PPO，`reach_hold` 18 帧 +
+`action_age`，seed 7），test last **2167**、best **2165**；硬片段 0.89 仍是 966。
+产物在 `.runtime/runs/gif-hold18/gifs/`：
+
+* `gif-hold18_frac0.59.gif` / `0.77`：打满 2400 帧；
+* `gif-hold18_frac0.71.gif`：2202 帧，对照基线 `p1-reach` 的 1950 帧；
+* `gif-hold18_frac0.89.gif`：966 帧，死亡片段；
+* 每个 GIF 配套 `_trace.png`（蓝=自机 x，橙=最近安全车道）。
+
+`gap_gif.py` 同时修了两个会静默误导的问题：编码时没有传 `action_age`（新策略最后
+一维永远是 0），以及脚本模式只读 `eval_fracs` 而不是 P0 的 `test_fracs`。
+
 
 
 ## 下一步（按依赖顺序）
