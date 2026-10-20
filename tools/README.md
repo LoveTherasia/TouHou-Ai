@@ -16,6 +16,7 @@
 | `research/gap_gif.py` | 训练好的策略放回 v3 场景跑，输出 GIF + 自机/缺口横向轨迹图 |
 | `research/gap_report.py` | 存活饱和时改看"飞行方式"（擦弹、最近弹距、横移占比） |
 | `research/aimed_probe.py` | 单颗斜向自机狙探针：检查策略是否把"自机所在车道"误判成安全 |
+| `research/viability_probe.py` | 时间展开 2D 可行集规划器：在完整 replay / 环形弹上找"还有没有活路" |
 | `research/gap_benchmark.py` | 避弹基准：站着不动 vs 斥力老师 vs 时空规划器 |
 
 ```powershell
@@ -67,6 +68,11 @@
     --run .runtime\runs\gif-aimfix --seeds 11,17,23
 .\.venv\Scripts\python.exe tools\research\aimed_probe.py `
     --run .runtime\runs\gif-aimfix --seeds 17 --gif
+
+# 时间展开可行集规划器（完整 replay；H=120, dt=3）
+.\.venv\Scripts\python.exe tools\research\viability_probe.py `
+    --fracs 0.59,0.65,0.71,0.77,0.83,0.89,0.95 `
+    --max-frames 2400 --dt 3 --horizon 120 --noop
 ```
 
 ## train — 训练入口
