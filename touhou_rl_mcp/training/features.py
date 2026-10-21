@@ -415,11 +415,16 @@ def grid_feature_dim_scales(scales: list[tuple[int, float]],
 def grid_observation_dim(size: int = GRID_DEFAULT_SIZE, use_velocity: bool = False,
                          use_invincible: bool = False, use_boss: bool = False,
                          use_danger_grad: bool = False,
-                         scales: list[tuple[int, float]] | None = None) -> int:
-    """危险图观测维度 = 栅格(可多尺度) + 全局特征 (自机/Boss/残机/无敌帧...)。"""
+                         scales: list[tuple[int, float]] | None = None,
+                         use_wall_feat: bool = False) -> int:
+    """危险图观测维度 = 栅格(可多尺度) + 全局特征 (自机/Boss/残机/无敌帧...)。
+
+    ``use_wall_feat`` 时再在末尾追加 12 维墙特征 (与默认观测同一套布局)。
+    """
     grid_dim = (grid_feature_dim_scales(scales, use_velocity) if scales
                 else grid_feature_dim(size, use_velocity))
-    return grid_dim + global_feature_dim(use_invincible, use_boss, use_danger_grad)
+    dim = grid_dim + global_feature_dim(use_invincible, use_boss, use_danger_grad)
+    return dim + (WALL_FEATURE_DIM if use_wall_feat else 0)
 
 
 def _encode_globals(vec: np.ndarray, state: GameState, px: float, py: float,
@@ -511,6 +516,7 @@ def encode_state_grid(
     use_invincible: bool = False,
     use_boss: bool = False,
     use_danger_grad: bool = False,
+    use_wall_feat: bool = False,
     out: np.ndarray | None = None,
     validate: bool = True,
 ) -> np.ndarray:
@@ -530,10 +536,12 @@ def encode_state_grid(
     channels = grid_channels(use_velocity)
     grid_dim = grid_feature_dim_scales(resolved, use_velocity)
     gdim = global_feature_dim(use_invincible, use_boss, use_danger_grad)
-    vec = np.empty(grid_dim + gdim, dtype=np.float64) if out is None else out
+    wall_dim = WALL_FEATURE_DIM if use_wall_feat else 0
+    vec = (np.empty(grid_dim + gdim + wall_dim, dtype=np.float64)
+           if out is None else out)
     px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
     py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
-    _encode_globals(vec[grid_dim:], state, px, py,
+    _encode_globals(vec[grid_dim:grid_dim + gdim], state, px, py,
                     use_invincible, use_boss, use_danger_grad)
 
     vec[:grid_dim] = 0.0
@@ -546,6 +554,8 @@ def encode_state_grid(
             _splat_scale(state, px, py, gsize, gspan, use_velocity,
                          vec[off : off + cells].reshape(gsize, gsize, channels), arr)
             off += cells
+    if use_wall_feat:
+        vec[-WALL_FEATURE_DIM:] = wall_features(state, px, py)
     return vec
 
 
@@ -589,23 +599,20 @@ def gap_encoder(config: Any) -> GapObservation:
 
 def observation_dim(config: Any) -> int:
     """按 :class:`TrainConfig` 算出观测维度 (缺口 / 危险图 / 最近K弹三选一)。"""
-    if getattr(config, "use_wall_feat", False) and (
-            getattr(config, "use_gap", False) or getattr(config, "use_grid", False)):
-        # 墙特征目前只接在"最近 K 颗弹"这条口径上: 缺口/危险图各有自己的布局,
-        # 混用会让"末尾 12 维"的位置假设失效 (而 checkpoint 扩维正依赖这个位置)。
-        raise ValueError("use_wall_feat 只能与默认观测同用 (不支持 use_gap / use_grid)")
+    wall = WALL_FEATURE_DIM if getattr(config, "use_wall_feat", False) else 0
     if getattr(config, "use_gap", False):
-        return gap_observation_dim(gap_spec_from(config))
+        return gap_observation_dim(gap_spec_from(config)) + wall
     if getattr(config, "use_grid", False):
         size = getattr(config, "grid_size", GRID_DEFAULT_SIZE)
         span = getattr(config, "grid_span", GRID_DEFAULT_SPAN)
         scales = grid_scales_from(getattr(config, "grid_scales", ""),
                                   default_size=size, default_span=span)
         return grid_observation_dim(size, config.bullet_velocity, config.use_invincible,
-                                    config.use_boss, config.use_danger_grad, scales=scales)
+                                    config.use_boss, config.use_danger_grad, scales=scales,
+                                    use_wall_feat=bool(wall))
     return feature_dim(config.k_bullets, config.bullet_velocity, config.k_enemies,
                        config.use_invincible, config.use_boss, config.use_danger_grad,
-                       getattr(config, "use_wall_feat", False))
+                       bool(wall))
 
 
 class ObservationEncoder:
@@ -717,12 +724,22 @@ def encode_observation(state: GameState, config: Any,
     的 one-hot 拼进观测 —— 宏动作有 6 帧承诺, 策略必须知道自己在往哪走。
     ``action_age`` 是"连续同向决策了多少步", 同样只对 ``use_gap`` 有效。
     """
-    if getattr(config, "use_wall_feat", False) and (
-            getattr(config, "use_gap", False) or getattr(config, "use_grid", False)):
-        raise ValueError("use_wall_feat 只能与默认观测同用 (不支持 use_gap / use_grid)")
+    wall = bool(getattr(config, "use_wall_feat", False))
     if getattr(config, "use_gap", False):
-        return gap_encoder(config)(state, prev_action=prev_action, out=out,
+        base = gap_encoder(config)(state, prev_action=prev_action,
                                    action_age=action_age)
+        if not wall:
+            if out is not None:
+                out[...] = base
+                return out
+            return base
+        dim = base.shape[0] + WALL_FEATURE_DIM
+        vec = np.empty(dim, dtype=np.float64) if out is None else out
+        vec[:base.shape[0]] = base
+        px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+        py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+        vec[-WALL_FEATURE_DIM:] = wall_features(state, px, py)
+        return vec
     if getattr(config, "use_grid", False):
         return encode_state_grid(
             state,
@@ -735,6 +752,7 @@ def encode_observation(state: GameState, config: Any,
             use_invincible=config.use_invincible,
             use_boss=config.use_boss,
             use_danger_grad=config.use_danger_grad,
+            use_wall_feat=wall,
             out=out,
         )
     return encode_state(

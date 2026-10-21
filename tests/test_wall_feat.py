@@ -129,27 +129,26 @@ class DimTest(unittest.TestCase):
         self.assertEqual(obs.shape, (155,))
         self.assertEqual(float(np.abs(obs[-WALL_FEATURE_DIM:]).max()), 0.0)
 
-    def test_wall_feat_is_rejected_by_grid_and_gap(self) -> None:
-        class Cfg:
-            use_gap = True
-            use_grid = False
-            use_wall_feat = True
-            k_bullets = 16
-            bullet_velocity = True
-            k_enemies = 0
-            use_invincible = True
-            use_boss = True
-            use_danger_grad = False
-            gap_grid = True
-            gap_geo = True
-            gap_clearance = True
-            gap_prev_action = True
-            gap_action_age = False
-            gap_action_age_cap = 12
-            gap_layers = 1
+    def test_wall_feat_is_supported_by_grid_and_gap(self) -> None:
+        # 墙特征必须能叠在"危险图 / 缺口"观测上: 只在 k_bullets 上可用等于
+        # 把用户明确认为不合适的口径当成唯一路径。
+        pos, vel = wall_row(gap=(260.0, 356.0))
+        st = state(bullets=pos, vel=vel)
 
-        with self.assertRaises(ValueError):
-            encode_observation(state(), Cfg())
+        grid = ObservationEncoder(use_grid=True, grid_size=8, bullet_velocity=True,
+                                  use_wall_feat=True)
+        grid_base = ObservationEncoder(use_grid=True, grid_size=8, bullet_velocity=True)
+        self.assertEqual(grid.dim, grid_base.dim + WALL_FEATURE_DIM)
+        obs = grid(st)
+        np.testing.assert_allclose(obs[-WALL_FEATURE_DIM:],
+                                   wall_features(st), atol=1e-9)
+
+        gap = ObservationEncoder(use_gap=True, gap_grid=False, use_wall_feat=True)
+        gap_base = ObservationEncoder(use_gap=True, gap_grid=False)
+        self.assertEqual(gap.dim, gap_base.dim + WALL_FEATURE_DIM)
+        obs = gap(st)
+        np.testing.assert_allclose(obs[-WALL_FEATURE_DIM:],
+                                   wall_features(st), atol=1e-9)
 
 
 class WidenInputTest(unittest.TestCase):
