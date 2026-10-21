@@ -83,6 +83,11 @@ def main() -> int:
     ap.add_argument("--danger-grad", action="store_true")
     ap.add_argument("--wall-feat", action="store_true",
                     help="观测末尾含 12 维墙特征 (必须与训练时一致)")
+    ap.add_argument("--grid", action="store_true",
+                    help="观测改用危险图(以自机为中心的弹幕栅格)")
+    ap.add_argument("--grid-size", type=int, default=16, help="危险图边长(格数)")
+    ap.add_argument("--grid-span", type=float, default=110.0, help="危险图半径(像素)")
+    ap.add_argument("--grid-scales", default="", help="多尺度危险图 'size:span,...'")
     ap.add_argument("--no-focus", dest="focus", action="store_false")
     ap.set_defaults(focus=True)
     ap.add_argument("--hier-switch", action="store_true",
@@ -120,6 +125,8 @@ def main() -> int:
             k_enemies=args.k_enemies, bullet_velocity=args.bullet_velocity,
             use_danger_grad=args.danger_grad, use_focus=args.focus,
             use_wall_feat=args.wall_feat,
+            use_grid=args.grid, grid_size=args.grid_size, grid_span=args.grid_span,
+            grid_scales=args.grid_scales,
             hier_switch=args.hier_switch,
             planner_horizon=args.planner_horizon, planner_dt=args.planner_dt,
         )

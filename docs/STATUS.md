@@ -133,7 +133,7 @@ native/speedhack/  32 位时间缩放钩子（可选，需自行构建）
 
 | 优先级 | 改进项 | 现状 | 验收标准 |
 |---|---|---|---|
-| **P0** | **观测加"墙特征"并在 mock 上落地**：143 维只有最近 16 颗弹，看不见 150px 外的墙 | **155 维 mock 验收已完成**：墙专用 `wall_gate 814→2000`，但 `aimed_spread/dense/fan` 崩到 561~683；KL/混合/课程/权重 soup/朴素切换都未同时保住两者。危险图+墙特征已支持（`use_grid/use_gap`），尚未正式多任务训练。见 [`WALL_FEAT_MOCK.md`](WALL_FEAT_MOCK.md) | 墙专家做 DAgger（通用策略状态起手）后中局也能 2000；或接受两专家切换；危险图+墙特征正式训练 |
+| **P0** | **观测加"墙特征"并在 mock 上落地**：143 维只有最近 16 颗弹，看不见 150px 外的墙 | **已完成两轮 mock 验收**：① 155 维（k_bullets 底）墙专用 `wall_gate 814→2000`，但通用弹型崩到 561~683；② **危险图 12×12/±330 + 墙特征（459 维，无 k_bullets）**从零 48 局：`wall_gate 2000`，但 `dense_ring 513 / aimed_spread 548 / ring_gate 682 / closing 758`，均值 1035。见 [`WALL_FEAT_MOCK.md`](WALL_FEAT_MOCK.md) / [`DANGER_GRID_TRAIN.md`](DANGER_GRID_TRAIN.md) | 数据量提到 300~500 局或分场景训练；普通弹型 ≥4000 步、wall ≥1500 且不遗忘 |
 | **P0** | **replay 数据重录 + 重训**：录制端补 despawn/life，旧脚本 37% 零弹速/2686 重复 | `DanmakuRecorder` 已加 life，`fix_danmaku.py` 可修；`th11_replay_v2.json` 尚未重录；gap 60 局只有 6604/1152/2412 帧 | 同屏弹数稳定在几十~几百；gap 300+ 局或分段训练；用 `pattern_bench` 验收 |
 | **P1** | **真机稳定率**：3 局太少，只有 1 次通关第 1 面；看门狗/激光/无敌未完成 | ep1 4260 步进第 2 面；ep2/ep3 打到关底；`step_frames=2` 约 34 步/秒 | 第一面 `stage≥2` ≥3/5；失焦/进程/黑屏自动复位；补 laser/invincible |
 | **P1** | **蒸馏质量**：老师强 ≠ 学生强（hybrid 4770 → R2 2469；score 对准 37%） | PPO 已修好（3905/6274/77%），优于 rule-DAgger；hybrid/score 蒸馏仍弱 | 学生 ≥ rule-DAgger R2；`pattern_bench` 报伤害/对准/最差 |
@@ -674,6 +674,7 @@ ep1 在 203 秒进第 2 面，而修复前同样局数连关底都摸不到。
 - 可行域规划器（解决 wall_gate）：`docs/VIABILITY_PLANNER.md`
 - 分层切换（策略 + 规划器，含三次训练的负面结果）：`docs/HIERARCHICAL.md`
 - 155 维墙特征 mock 验收（墙学会但遗忘通用弹型）：`docs/WALL_FEAT_MOCK.md`
+- 危险图（无 k_bullets）+ 墙特征训练：`docs/DANGER_GRID_TRAIN.md`
 - 掉落物（道具）偏移：尝试与排除范围：`docs/ITEMS.md`
 - 真机差距归因 / 复刻 replay 弹幕实测：`docs/REAL_GAP.md`
 - 训练看板：`docs/DASHBOARD.md`
