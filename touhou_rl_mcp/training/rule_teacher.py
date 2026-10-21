@@ -100,7 +100,12 @@ class RuleTeacher:
                         "planner": self.planner}
 
     # ------------------------------------------------------------------
-    def _choose_force(self, state: GameState, px: float, py: float) -> tuple[int, float]:
+    def force_vector(self, state: GameState, px: float, py: float) -> tuple[float, float, float]:
+        """弹幕斥力 + 归位 + 边界回避 的合力 ``(fx, fy, nearest)``.
+
+        ``HybridTeacher`` 直接拿它当"安全先验", 保证两个老师的建议永远同源:
+        改这里的力场, 两边的标签会一起变。
+        """
         fx = fy = 0.0
         nearest = 9999.0
         if state.bullets:
@@ -137,6 +142,12 @@ class RuleTeacher:
             elif py > PLAYFIELD_HEIGHT - m:
                 fy -= (py - (PLAYFIELD_HEIGHT - m)) / m * self.edge_weight
 
+        return fx, fy, nearest
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def direction_from_force(fx: float, fy: float) -> int:
+        """合力 -> 9 个方向之一 (带 12% 死区, 免得微弱合力导致左右互搏)."""
         mag = math.hypot(fx, fy)
         dx = dy = 0
         if mag > 1e-3:
@@ -148,7 +159,11 @@ class RuleTeacher:
                 dy = 1
             elif fy < -0.12 * mag:
                 dy = -1
-        return _DIR_MAP.get((dx, dy), 0), nearest
+        return _DIR_MAP.get((dx, dy), 0)
+
+    def _choose_force(self, state: GameState, px: float, py: float) -> tuple[int, float]:
+        fx, fy, nearest = self.force_vector(state, px, py)
+        return self.direction_from_force(fx, fy), nearest
 
     # ------------------------------------------------------------------
     def _choose_horizon(self, state: GameState, px: float, py: float) -> tuple[int, float]:

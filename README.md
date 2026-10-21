@@ -210,7 +210,7 @@ th_train_stop({"save": true})
 
 | 权重 | 含义 |
 |---|---|
-| `score_scale` `graze_scale` `power_scale` | Δ分数 / Δ擦弹 / Δ灵敏度 的缩放 |
+| `score_scale` `graze_scale` `power_scale` | Δ分数 / Δ擦弹 / Δ灵力 的缩放；`score_scale` 是"攻击意图"的主信号（见 6.1） |
 | `life_bonus` / `miss_penalty` / `death_penalty` | 加残 / 掉残 / Game Over |
 | `stage_clear_bonus` / `game_clear_bonus` | 过面 / 通关 |
 | `boss_damage_scale` | 对 Boss 造成伤害（需 `boss_hp` 偏移） |
@@ -229,6 +229,76 @@ th_train_stop({"save": true})
 ```json
 {"reward": -139.83, "info": {"reward_parts": {"score": 0.0009, "graze": 0.06, "miss": -50.0, "death": -100.0, "time": -0.002}}}
 ```
+
+### 6.1 攻击意识：`score_scale` 为什么必须调大
+
+默认权重下 `score_scale = 1e-5`，而 mock 里对准 Boss **每帧只加 4 分**——打满一局
+（约 2 万分）折算成奖励只有 **+0.2**，等于没有信号；同时 `danger_scale = 4.0`
+一局能扣掉 **−3300**。实测（规则老师，第一面，3196 步）的奖励分解：
+
+| 分量 | 累计 |
+|---|---|
+| `danger` | −3306 |
+| `stage_clear` | +3000 |
+| `alive` | +825 |
+| `death` + `miss` | −1000 |
+| `boss_damage` | +460 |
+| `score` | **+0.2** |
+
+旧权重实际教的是"离弹幕越远越好"，而密集弹幕里"远"只有角落——
+**不攻击是权重的必然结果，不是模型学不会**。
+
+具名 profile `attack`（`rl/reward.py`，**2026-10-21 起已是默认值**）按三条原则重配：
+
+- `score_scale 1e-5 → 3e-2`：对准 Boss 每步 +0.12，与 `alive_bonus`(0.3) 同量级，
+  一局 2 万分 ≈ +600；
+- `danger_scale 4.0 → 0.8`、`danger_radius 50 → 32`：危险度退回"微调"，
+  不再压过"站到 Boss 下面开火"的收益；
+- `miss_penalty -200` / `death_penalty -600` **不变**：一次被弹约等于 1000 步的攻击
+  收益，"用命换分"依然不划算 —— 存活仍是第一要素。
+
+实测（mock 第一面，贪心 12 局，`step_frames=1`）：
+
+| 策略 | 存活步 | Boss 伤害 | 对准率 | 净分 |
+|---|---|---|---|---|
+| 规则老师（参考） | 3196 | 5010 | 59% | 20222 |
+| DAgger 1 轮（120 局） | 3043 | 4462 | 78% | 19113 |
+| DAgger 2 轮（+100 局） | 3521 | 5476 | 80% | 22505 |
+| **DAgger 2 轮 + PPO（已修复）** | **3905** | **6274** | 77% | **24861** |
+| PPO + attack（修复前，60 局） | 999 | 45 | 2% | 1182 |
+| score-DAgger 3 轮（分数进监督） | 2594 | 1704 | 37% | 7752 |
+
+结论：**奖励配平让"打"变得划算**；PPO 修好之后第一次真正超过 DAgger。
+"分数进监督"（`training/score_teacher.py`）机制成立，但第一版老师比规则老师更难被
+小 MLP 拟合，蒸馏结果反而更差 —— 正确用法是"在规则老师的安全候选里按分数重排"。
+细节、bug 与复现命令见 [`docs/ATTACK_INTENT.md`](docs/ATTACK_INTENT.md)。
+
+**力场先验 + 分数重排（`--teacher hybrid`）**：把规则老师的力场当安全先验、奖励权重
+当排序目标、安全阈值换成连续屏障。它**本身是全场最强的玩家**（4770 步 / 8617 伤害 /
+89% 对准，规则老师 3501 / 5344 / 78%），但蒸出来的学生反而更差（2469 步）——
+"老师更强 ≠ 学生更强"，且 R3 会回退。设计、四个负面结果与弹型基准见
+[`docs/HYBRID_TEACHER.md`](docs/HYBRID_TEACHER.md)。
+
+**验收要用弹型基准，不要只看单面存活**：
+
+```powershell
+python tools\pattern_bench.py --policy .runtime\policies\attack_ppo_fixed.npz `
+  --seeds 3 --max-steps 2000 --bullet-velocity --danger-grad --no-focus
+```
+
+8 种弹型里 7 种撑满上限（`attack_ppo_fixed`，平均 1852/2000 步），唯一硬失败是
+**`wall_gate`（662~814 步，3/3 种子死）**——而五个老师亲自打 `wall_gate` 也只有
+546~914 步。**能力上限在老师身上，不是"再训学生"能解决的。**
+
+```powershell
+# 训练时套用 (也会写进训练日志的 reward 行; 现在等同于默认值)
+python tools\mock_full_clear.py --reward-profile attack --teacher rule_dagger ...
+# 评估时用同一份奖励, 回报才可比
+python tools\eval_policy.py --policy .runtime\...\policy_best --reward-profile attack
+```
+
+训练/评估日志现在都会打印 **伤害 / 对准率 / 均净分**（来自 `EpisodeRecord` 的
+`boss_damage` / `align_ratio` / `score_gain`）——只看存活帧数会漏掉"活着但一枪不打"。
 
 ## 7. 真实游戏（`backend = "memory"`）
 
@@ -258,6 +328,18 @@ th_train_stop({"save": true})
 | 弹幕相关 | `dodge` 宏、弹幕可视化 |
 | `boss_hp` | `boss_damage_scale` 伤害奖励、Boss 血条 |
 | `frame` | 严格的帧同步（默认用 60Hz 墙钟同步） |
+
+**没有弹幕偏移的作品**：打开 `vision.enabled` 后，`memory` 后端在"内存里读不到弹幕"
+（该作品没有弹幕布局，或实体读取报错）时退化为**从截图检测**小亮块
+（亮度 + 饱和度 + 面积三重过滤），坐标同样换算成 384x448 场地坐标，因此 `dodge` 宏、
+危险度奖励、可视化都能直接复用：
+
+```jsonc
+{ "vision": { "enabled": true } }    // th_configure / config.json 都可以
+```
+
+代价是每次 `read_state` 多一次截图；拿不到弹速与半径，也可能把道具（P/B/F 方块）
+误判成弹幕。默认关闭；th11 有实体布局，永远不会走这条路。
 
 ### 7.3 用 MCP 自己标定偏移（不需要 Cheat Engine）
 
@@ -335,9 +417,9 @@ E:\TouHou-Ai\
 ├── examples\train.py                # 训练入口 (与 th_train_start 同一个 Trainer)
 ├── native\speedhack\                # 32 位时间缩放钩子 (DLL + 注入器 + 自检; build.ps1 构建)
 ├── tools\                           # 活跃 CLI (索引见 tools\README.md)
-│   ├── research\                    # 可复现实验 (gap_rl / gap_benchmark)
+│   ├── research\                    # 可复现实验 (gap_* / viability / value_distill / pattern_bench)
 │   └── legacy\                      # 已归档的一次性脚本 (见其 README)
-├── tests\                           # 133 个用例 (MCP 会话 / 训练 / 标定 / 看板 / 观测)
+├── tests\                           # 293 个用例 (会话 / 训练 / 标定 / 看板 / 观测 / 配置 / 视觉 / 老师 / 规划器 / 分层)
 ├── docs\
 │   ├── STATUS.md                    # 项目现状 + 路线图 (唯一现状来源)
 │   ├── OFFSET_CALIBRATION.md        # 内存偏移标定手册
@@ -346,6 +428,12 @@ E:\TouHou-Ai\
 │   ├── STAGE1_ATTEMPTS.md           # 第一面尝试记录
 │   ├── REPLAY_CLONING.md            # replay -> BC 设计
 │   ├── GAP_LEARNING.md              # 几何缺口 + 占用栅格的可行性实验
+│   ├── VALUE_DISTILL.md             # V(s) + 规划器 + 蒸馏实验
+│   ├── ATTACK_INTENT.md             # 攻击意图: 奖励配平 + 蒸馏加强 (实测)
+│   ├── HYBRID_TEACHER.md            # 力场先验+分数重排: 设计、负面结果、弹型基准
+│   ├── VIABILITY_PLANNER.md         # 可行域规划器: 时间展开 DP、四个踩过的坑、弹型结果
+│   ├── HIERARCHICAL.md              # 分层切换: 判别阈值、8 弹型结果、三次训练为何失败
+│   ├── PROJECT_REVIEW.md            # 工程评审快照 (结构/测试盲区/欠债)
 │   ├── DASHBOARD.md                 # 训练看板使用与扩展
 │   └── history\                     # 历史会话交接 (只读, 可能过时)
 ├── archive\                         # 非维护文件 (根目录残留 + 一次性诊断脚本)
@@ -356,31 +444,51 @@ E:\TouHou-Ai\
     ├── backends\
     │   ├── base.py                  # 后端接口
     │   ├── mock.py                  # 纯 Python 弹幕模拟器 (可复现)
+    │   ├── patterns.py              # 弹型库 (ring/fan/wall_gate/aimed_single…)
     │   └── memory.py                # 真实游戏: 内存读取 + 按键注入 + 截图
     ├── games\
     │   ├── registry.py              # 作品注册表 + 安装目录自动查找
+    │   ├── calibration.py           # 把标定结果写回 offsets json
     │   └── offsets\th06..th14.json  # 各作品的内存偏移表
     ├── inputs\
     │   ├── keyboard.py              # SendInput 键盘注入 + 窗口置前
     │   ├── actions.py               # 动作字符串 -> 按键/宏 解析
-    │   └── controller.py            # 60Hz 帧同步控制器 + 宏动作
+    │   ├── controller.py            # 60Hz 帧同步控制器 + 宏动作
+    │   ├── dialogue.py              # 对话/静默期点按 Z 快进
+    │   └── bombguard.py             # 紧急放弹保护 (规则, 非策略动作)
     ├── memory\
     │   ├── process.py               # 进程/窗口/模块 (纯 ctypes, 支持 64 位读 32 位)
     │   ├── reader.py                # 按偏移表把内存读成 GameState
+    │   ├── entities.py              # 弹幕数组/敌人链表/Boss (带版本签名校验)
+    │   ├── bullettrack.py           # 按槽位跨帧差分弹速
+    │   ├── danmaku.py               # 真机弹幕录制/回放脚本
+    │   ├── cheats.py                # 标定用内存锁 (临时改残机等)
+    │   ├── slowdown.py              # 时间缩放钩子客户端 (接 native/speedhack)
     │   └── scanner.py               # 首扫/再扫, 候选持久化
     ├── capture\
     │   ├── screenshot.py            # PrintWindow/BitBlt 多级回退截图
+    │   ├── bullets.py               # 视觉弹幕兜底 (无偏移作品, vision.enabled)
     │   └── visualize.py             # 状态可视化 (PIL)
     ├── rl\
     │   ├── reward.py                # 奖励函数 (权重可在线调) + 具名 profile
     │   └── stats.py                 # 单局/跨局统计
     ├── dashboard\                   # 训练可视化看板 (标准库 + 原生 canvas)
     │   ├── registry.py              # run 发现 / JSONL 读取 / 指标自动发现
+    │   ├── recipes.py               # 启动训练的白名单食谱 (不开放任意命令)
+    │   ├── launcher.py              # 按食谱起子进程 + 控制台实时回显
     │   ├── server.py                # http.server 接口
     │   └── static\                  # 单页前端
     └── training\                    # 本地智能体训练 (LLM 当"教练", 不逐帧亲自打)
         ├── features.py              # 状态 -> 特征向量 (危险图 / 最近 K 弹)
         ├── occupancy.py             # 未来占用栅格 + TTA 缺口观测
+        ├── gap_label.py             # 缺口标签口径 (now/reach/future/slack/承诺期)
+        ├── gap_teacher.py           # 缺口老师协议 (有状态, 支持承诺/滞回)
+        ├── rule_teacher.py          # 规则老师 (与 dodge 宏同源, BC/DAgger 用)
+        ├── score_teacher.py         # 按奖励(分数)在安全方向里排序打标签 (score_dagger)
+        ├── hybrid_teacher.py        # 力场先验 + 分数重排 + 软安全屏障 (hybrid / hybrid_dagger)
+        ├── viability.py             # 时间展开可行域规划器 (网格反向 DP, 提前站位)
+        ├── hierarchical.py          # 分层切换: 墙/收网判别 + 控制器 + 只在墙段打标签的老师
+        ├── tactical.py              # 战术守卫 (放弹/对话等时机规则)
         ├── planner.py               # 时空搜索规划器 (实验脚手架)
         ├── journal.py               # 训练日志 train.jsonl / steps.jsonl
         ├── policy.py                # 纯 numpy MLP 策略 (PPO / REINFORCE + 模仿)
@@ -409,12 +517,16 @@ E:\TouHou-Ai\
 
 **下一步（按价值排序，持续更新于 [`docs/STATUS.md`](docs/STATUS.md)）**
 
-1. **奖励重平衡 + 诊断"苟活"**：`alive_bonus` 远大于 `|time_penalty|`，长局里存活收益
-   可能压过通关收益；先加诊断（无敌期输出占比、动作分布），再调权重。
-2. **观测增强**：弹幕半径/类型、TTC（预计最近接近距离）、多帧堆叠。
-3. **真机鲁棒性**：进程/窗口/焦点看门狗，异常自动复位。
-4. **补齐 TH11** 的 `invincible`、激光；之后再考虑第二部作品。
-5. **replay → BC**：`tools/record_replay.py --bc-out` 采集，`tools/bc_from_replay.py` 训练
+1. ~~**奖励重平衡 + 诊断"苟活"**~~：已完成一半 —— `score_scale` / `danger_scale` 已按
+   "攻击 + 生存"重配平（[6.1](#61-攻击意识score_scale-为什么必须调大)），并新增
+   伤害/对准率诊断；`alive_bonus` 高于 `|time_penalty|` 的"苟活"空间仍在。
+2. **奖励加权 DAgger**：让老师在自己给出的安全候选里按分数排序再打标签 ——
+   目前 `score_scale` 只影响 PPO，而 PPO 会把 DAgger 打崩（[`docs/ATTACK_INTENT.md`](docs/ATTACK_INTENT.md)）。
+3. **PPO 稳定性**：每 batch 评估早停 + 余弦 lr + 更小 batch；或改用优势加权回归。
+4. **观测增强**：弹幕半径/类型、TTC（预计最近接近距离）、多帧堆叠。
+5. **真机鲁棒性**：进程/窗口/焦点看门狗，异常自动复位。
+6. **补齐 TH11** 的 `invincible`、激光；之后再考虑第二部作品。
+7. **replay → BC**：`tools/record_replay.py --bc-out` 采集，`tools/bc_from_replay.py` 训练
    （设计见 [`docs/REPLAY_CLONING.md`](docs/REPLAY_CLONING.md)）。
 
 ---

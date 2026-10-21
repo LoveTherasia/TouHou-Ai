@@ -126,6 +126,41 @@ class TestTrainer(unittest.TestCase):
         self.assertAlmostEqual(env.reward_model.weights["shaping_scale"], 0.25)
         self.assertAlmostEqual(env.reward_model.weights["danger_scale"], 1.5)
 
+    def test_kl_anchor_captured_when_started_without_teacher(self) -> None:
+        """直接以"无老师 + KL 锚"启动 (载入蒸馏策略再 PPO) 也必须抓到锚点。
+
+        历史 bug: 参考策略只在 ``reconfigure`` 摘掉老师时抓, 所以 PPO 微调一个
+        已蒸馏的策略时 ``kl_anchor`` 静默失效, 表现为"PPO 总把 DAgger 打崩"。
+        """
+        env = make_env()
+        env.start()
+        self.addCleanup(env.close)
+        config = tiny_config(kl_anchor=1.0, teacher="", episodes=0)
+        trainer = Trainer(env, config, env_lock=env.lock)
+        self.assertIsNone(trainer._rl_ref)
+
+        trainer.start()
+        try:
+            self.assertIsNotNone(trainer._rl_ref, "kl_anchor 开启时必须冻结参考策略")
+            ref = trainer._rl_ref
+            self.assertTrue(ref)
+            # 冻结的是"当前"参数, 不是空列表
+            self.assertEqual(ref[0].shape, trainer.policy.W[0].shape)
+        finally:
+            trainer.stop(save=False)
+
+    def test_kl_anchor_skipped_when_teacher_is_active(self) -> None:
+        env = make_env()
+        env.start()
+        self.addCleanup(env.close)
+        trainer = Trainer(env, tiny_config(kl_anchor=1.0, teacher="rule", episodes=0),
+                          env_lock=env.lock)
+        trainer.start()
+        try:
+            self.assertIsNone(trainer._rl_ref, "还有老师时不该冻结 RL 锚 (那是老师前分布)")
+        finally:
+            trainer.stop(save=False)
+
 
 class TestGapObservationInTrainer(unittest.TestCase):
     """缺口观测 / 缺口老师 / 基准场景接入 Trainer 的契约。"""
@@ -223,9 +258,31 @@ class TestGapObservationInTrainer(unittest.TestCase):
 
 
 class TestValueScale(unittest.TestCase):
-    """价值回归必须按整批回报的量级缩放, 否则平方损失会冲垮共享隐层。"""
+    """价值回归必须按整批回报的量级缩放, 否则平方损失会冲垮共享隐层。
 
-    def test_gae_is_linear_in_the_scale(self) -> None:
+    注意口径 (2026-10-21 修正): 奖励除以 scale, 但**价值本身已经是"缩放后的
+    回报"量纲**, 不能再除一次 —— 否则基准被压到 ~0, 优势退化成逐步即时奖励。
+    """
+
+    def test_gae_is_linear_in_the_scale_when_values_are_zero(self) -> None:
+        import numpy as np
+
+        from touhou_rl_mcp.training.trainer import Trajectory
+
+        traj = Trajectory(
+            observations=[], actions=[], logps=[], values=[0.0] * 20,
+            rewards=[100.0] * 20, dones=[False] * 20, bootstrap_value=0.0,
+        )
+        adv_raw, ret_raw = Trainer._gae(traj, 0.99, 0.95)
+        adv_scaled, ret_scaled = Trainer._gae(traj, 0.99, 0.95, scale=100.0)
+        self.assertTrue(np.allclose(adv_scaled, adv_raw / 100.0))
+
+    def test_value_targets_are_not_divided_twice(self) -> None:
+        """V 已经是"缩放后的回报", 再除一次 scale 会让目标塌到 0 附近。
+
+        这里是 PPO 微调必崩的直接原因: 基准≈0 时优势≈逐步奖励, 策略只贪眼前一步
+        (躲开当前的弹、不站位输出、随后被后续弹幕打死)。
+        """
         import numpy as np
 
         from touhou_rl_mcp.training.trainer import Trajectory
@@ -234,13 +291,8 @@ class TestValueScale(unittest.TestCase):
             observations=[], actions=[], logps=[], values=[10.0] * 20,
             rewards=[100.0] * 20, dones=[False] * 20, bootstrap_value=10.0,
         )
-        adv_raw, ret_raw = Trainer._gae(traj, 0.99, 0.95)
-        adv_scaled, ret_scaled = Trainer._gae(traj, 0.99, 0.95, scale=100.0)
-        self.assertTrue(np.allclose(adv_scaled, adv_raw / 100.0))
-        self.assertTrue(np.allclose(ret_scaled, ret_raw / 100.0))
-        # 缩放后价值目标从 O(1e3) 降到 O(10), 平方损失从 1e6 降到 1e2 量级
-        self.assertLess(float(np.abs(ret_scaled).max()),
-                        0.05 * float(np.abs(ret_raw).max()))
+        _adv, ret = Trainer._gae(traj, 0.99, 0.95, scale=100.0)
+        self.assertGreater(float(np.abs(ret).max()), 1.0, "价值目标被二次缩放了")
 
     def test_value_scale_uses_the_trajectory_magnitude(self) -> None:
         from touhou_rl_mcp.training.trainer import Trajectory

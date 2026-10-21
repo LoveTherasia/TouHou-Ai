@@ -29,8 +29,12 @@ from touhou_rl_mcp.training.trainer import build_action_table  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", default=".runtime/mock_bc4/policy_best")
-    ap.add_argument("--teacher", default="", choices=["", "rule"],
-                    help="用规则老师代替策略 (当前最强的 mock 玩家)")
+    ap.add_argument("--hier-switch", action="store_true",
+                    help="分层切换: 常规局面用策略, 整幅横墙/多向收网时改用可行域规划器")
+    ap.add_argument("--hier-replan-every", type=int, default=1,
+                    help="分层切换: 墙段内沿用上次规划方向的步数 (2~3 可提速)")
+    ap.add_argument("--teacher", default="", choices=["", "rule", "score", "viability"],
+                    help="用老师代替策略: rule=纯躲避; score=按奖励权重(会打 Boss)")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--every", type=int, default=6, help="每多少 step 抓一帧")
     ap.add_argument("--max-steps", type=int, default=20000)
@@ -53,11 +57,12 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     policy = None
-    teacher = RuleTeacher() if args.teacher == "rule" else None
+    teacher = None
+    controller = None
     actions: list[str] = []
     enc = None
-    label = "teacher:rule"
-    if policy is None and teacher is None:
+    label = f"teacher:{args.teacher}"
+    if not args.teacher:
         npz = Path(args.policy).with_suffix(".npz")
         policy = MLPPolicy.load(npz)
         meta_path = npz.with_suffix(".json")
@@ -70,8 +75,12 @@ def main() -> int:
         label = str(npz)
         print(f"[demo] policy={npz} obs={policy.obs_dim} hidden={list(policy.hidden)} "
               f"actions={len(actions)} {enc}")
-    else:
-        print("[demo] 使用规则老师 RuleTeacher (无需策略文件)")
+        if args.hier_switch:
+            from touhou_rl_mcp.training.hierarchical import HierarchicalController
+
+            controller = HierarchicalController(policy, enc, actions,
+                                                replan_every=args.hier_replan_every)
+            label += "+hier"
 
     cfg = Config.load()
     cfg.patch({"backend": "mock", "game": "th11", "step_frames": args.step_frames,
@@ -81,6 +90,19 @@ def main() -> int:
                "visualize": {"scale": 1.0, "show_grid": True, "show_bullets": True, "show_hud": True}})
     env = TouhouEnv(cfg, registry=GameRegistry())
     env.start()
+    if args.teacher == "rule":
+        teacher = RuleTeacher()
+        print("[demo] 使用规则老师 RuleTeacher (只躲, 不主动追 Boss)")
+    elif args.teacher == "score":
+        from touhou_rl_mcp.training.score_teacher import ScoreTeacher
+
+        teacher = ScoreTeacher(weights=dict(cfg.section("reward")))
+        print("[demo] 使用 ScoreTeacher (安全优先 + 按分数选位)")
+    elif args.teacher == "viability":
+        from touhou_rl_mcp.training.viability import ViabilityPlanner
+
+        teacher = ViabilityPlanner(horizon=180, dt=2, aim_weight=0.15)
+        print("[demo] 使用 ViabilityPlanner (时间展开可行域, 提前站位)")
 
     report = {"source": label, "step_frames": args.step_frames, "episodes": []}
     strips: list[Image.Image] = []
@@ -95,6 +117,8 @@ def main() -> int:
         for i in range(args.max_steps):
             if teacher is not None:
                 action, _ = teacher.choose(state, state.frame, "shoot")
+            elif controller is not None:
+                action = controller.act(state)
             else:
                 obs = enc(state)
                 action = actions[policy.greedy(obs)]
@@ -110,11 +134,14 @@ def main() -> int:
             if res.done or res.truncated:
                 break
         ep_info = {"episode": ep, "seed": seed, "steps": i + 1, "return": round(total, 2),
+                   "planner_steps": getattr(controller, "planner_steps", 0) if controller else 0,
                    "max_stage": state.stage, "lives": state.lives, "score": state.score,
                    "done_reason": res.info.get("done_reason"), "frames": len(frames), "trace": trace}
         report["episodes"].append(ep_info)
+        switched = getattr(controller, "planner_steps", 0) if controller else 0
+        extra = f" 交给规划器={switched} 步" if controller else ""
         print(f"[demo] 第 {ep} 局(seed={seed}): 步数={i + 1} 到达面数={state.stage} 残机={state.lives} "
-              f"分数={state.score} 结束={res.info.get('done_reason')} 抓帧={len(frames)}")
+              f"分数={state.score} 结束={res.info.get('done_reason')} 抓帧={len(frames)}{extra}")
 
         if frames:
             w = args.gif_width

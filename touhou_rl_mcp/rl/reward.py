@@ -71,6 +71,43 @@ REWARD_PROFILES: dict[str, dict[str, float]] = {
         # (RewardModel 里所有未列出的权重默认 0.0, 包括这个整体缩放)。
         "shaping_scale": 1.0,
     },
+    # 攻击意识 (生存仍然优先): 让"打中敌人"从噪声变成有效信号。
+    # **2026-10-21 起这份配平已是 config.json 的默认值**; 保留具名 profile 是为了
+    # 在命令行/实验里显式引用 (tools/*.py --reward-profile attack)。
+    #
+    # 实测依据 (mock 第一面, 规则老师 3196 步, 旧权重):
+    #   danger -3306 / stage_clear +3000 / alive +825 / boss_damage +460 / **score +0.2**
+    # —— 危险度惩罚比其它所有项加起来还大 5 倍, 而分数项等于不存在。于是策略唯一的
+    # 学习信号就是"离弹幕越远越好", 而密集弹幕下"远"只有角落: 不攻击是这套权重的
+    # 必然结果, 不是模型学不会。
+    #
+    # 新配平的三条原则:
+    #   1. **分数有分量**: score_scale 1e-5 -> 3e-2。对准 Boss 时 mock 每帧 +4 分,
+    #      即 0.12 奖励/步, 与 alive_bonus (0.3) 同量级; 一局 2 万分 ≈ +600。
+    #   2. **危险度降为"微调"而不是"主导"**: 4.0 -> 0.8、半径 50 -> 32。它仍会在
+    #      贴脸时扣分, 但不再压过"站到 Boss 下面开火"的收益。
+    #   3. **存活仍第一**: miss -200 / death -600 不动 —— 一次被弹约等于 1000 步的
+    #      攻击收益, 所以"用命换分"依然不划算。
+    "attack": {
+        "score_scale": 3e-2,
+        "boss_damage_scale": 0.1,
+        "danger_scale": 0.8,
+        "danger_radius": 32.0,
+        "alive_bonus": 0.3,
+        "time_penalty": -0.01,
+        "graze_scale": 0.02,
+        "miss_penalty": -200.0,
+        "death_penalty": -600.0,
+        "stage_clear_bonus": 1500.0,
+        "game_clear_bonus": 6000.0,
+        "spell_capture_bonus": 20.0,
+        "spell_clear_bonus": 150.0,
+        "life_bonus": 5.0,
+        "power_scale": 0.1,
+        "invincible_output_scale": 0.0,
+        "clip": 8000.0,
+        "shaping_scale": 1.0,
+    },
 }
 
 

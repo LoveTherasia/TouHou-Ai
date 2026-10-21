@@ -399,8 +399,45 @@ class TestDanmakuScript(unittest.TestCase):
         self.assertEqual(rec.spawns[1].vx, 2.0)
         self.assertEqual(rec.frame, 4)
 
+    def test_recorder_tracks_bullet_lifetime(self) -> None:
+        """弹消失时要回填存活帧数 —— 没有它 mock 里的弹永远不会消失."""
+        from touhou_rl_mcp.memory.danmaku import DanmakuRecorder
+
+        def st(frame, slots, pts):
+            return GameState(frame=frame, in_game=True, bullets=pts,
+                             raw={"entities": {"bullets": {"status": "ok", "active_slots": slots}}})
+
+        rec = DanmakuRecorder()
+        rec.update(st(1, [7], [(10.0, 10.0)]))     # tick1: 出现
+        rec.update(st(2, [7], [(10.0, 12.0)]))     # tick2: 确认速度, life 未定
+        self.assertEqual(len(rec.spawns), 1)
+        self.assertEqual(rec.spawns[0].life, 0)    # 还活着
+        rec.update(st(3, [7], [(10.0, 14.0)]))
+        rec.update(st(4, [7], [(10.0, 16.0)]))
+        rec.update(st(5, [], []))                  # tick5: 消失 -> life = 5-1 = 4
+        self.assertEqual(rec.spawns[0].life, 4)
+        script = rec.to_script()
+        self.assertEqual(len(script["spawns"][0]), 6)   # 第 6 列 life
+        self.assertEqual(script["spawns"][0][5], 4)
+
 
 class TestDialogueFastForward(unittest.TestCase):
+    def test_dialogue_actor_counts_as_empty(self) -> None:
+        """真机对话窗口里 enemies_alive 是 1~2 (剧本演员), 不能因此判定为"战斗中"."""
+        from touhou_rl_mcp.inputs.dialogue import DialogueAssist
+
+        def st(bullets: int, enemies: int) -> GameState:
+            return GameState(in_game=True, lives=1, bullet_count=bullets, enemies_alive=enemies,
+                             raw={"entities": {"bullets": {"status": "ok"},
+                                               "enemies": {"status": "ok"}}})
+
+        assist = DialogueAssist(threshold=1, max_enemies=2)
+        self.assertTrue(assist.is_empty(st(0, 2)))       # 两个演员 + 无弹 -> 对话
+        self.assertFalse(assist.is_empty(st(0, 3)))      # 三个敌人 -> 正常波次
+        self.assertFalse(assist.is_empty(st(4, 1)))      # 有弹 -> 战斗
+        more = DialogueAssist(threshold=1, max_enemies=0)
+        self.assertFalse(more.is_empty(st(0, 1)))        # 收紧到 0 就退回旧行为
+
     def test_is_empty_detection(self) -> None:
         from touhou_rl_mcp.inputs.dialogue import DialogueAssist
 

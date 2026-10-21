@@ -235,7 +235,42 @@ class MemoryBackend(Backend):
         state = self.reader.read_all()
         state.raw["game"] = self.spec.key
         state.raw["pid"] = self.pid
+        self._maybe_vision_bullets(state)
         return state
+
+    # ------------------------------------------------------------------
+    def _maybe_vision_bullets(self, state: GameState) -> None:
+        """视觉兜底: 内存里拿不到弹幕时, 从截图里检测 (默认关闭).
+
+        只在 ``vision.enabled=true`` **且**内存里没有可靠的弹幕来源时触发
+        (作品没有弹幕布局 / 实体读取报错), 因此对 TH11 的常规读数零影响。
+        视觉弹幕没有速度、也不区分道具与子弹, 只适合"给未标定作品一个能用的观测"。
+        """
+        if not self.config.get("vision.enabled", False):
+            return
+        memory_bullets = (state.raw.get("entities") or {}).get("bullets") or {}
+        if memory_bullets.get("status") == "ok":
+            return
+        try:
+            from ..capture.bullets import bullets_from_frame
+
+            image, method = self.screenshot()
+            bullets = bullets_from_frame(
+                image,
+                self.spec,
+                bright_thr=int(self.config.get("vision.bright_thr", 170)),
+                sat_thr=int(self.config.get("vision.sat_thr", 40)),
+                min_area=int(self.config.get("vision.min_area", 2)),
+                max_area=int(self.config.get("vision.max_area", 300)),
+                max_dim=int(self.config.get("vision.max_dim", 40)),
+            )
+        except Exception as exc:  # 截图失败不能打断读数, 只记录原因
+            state.raw["vision_error"] = f"{type(exc).__name__}: {exc}"
+            return
+        state.bullets = bullets
+        state.bullet_count = len(bullets)
+        state.raw["bullets_source"] = "vision"
+        state.raw["vision_method"] = method
 
     # ------------------------------------------------------------------
     def advance(self, frames: int) -> int:
@@ -338,6 +373,12 @@ class MemoryBackend(Backend):
                     "factor": float(self.config.get("slowdown.factor", 1.0) or 1.0),
                     "applied": self._speedhook_result,
                     "error": self._speedhook_error,
+                },
+                "vision": {
+                    "enabled": bool(self.config.get("vision.enabled", False)),
+                    # 只有内存里没有可靠弹幕来源时才会真的走截图
+                    "bullet_fallback": bool(self.config.get("vision.enabled", False))
+                    and not bool(self.spec.entities.get("bullets")),
                 },
             }
         )

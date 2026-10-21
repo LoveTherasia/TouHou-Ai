@@ -41,6 +41,14 @@ ENEMY_FEATURE_DIM = 4
 GLOBAL_FEATURE_DIM = 10
 #: 速度归一化尺度 (弹速约 1~6 px/帧)
 VELOCITY_SCALE = 8.0
+#: "墙特征"的维度: 覆盖率 / 缺口中心 / 缺口宽度 / 到达帧数 + 8 个列带占用
+WALL_FEATURE_DIM = 12
+#: 墙特征的列带数 (384px / 8 = 48px 一带, 比判别器的 16 列粗, 对 MLP 更好学)
+WALL_BANDS = 8
+#: 墙特征的前瞻帧数 (与规划器视野一致: 180 帧后才压到自机的墙不算)
+WALL_LOOKAHEAD = 180.0
+#: 竖直方向多近算"同一排" (px)
+WALL_ROW_BAND = 26.0
 
 
 def bullet_feature_dim(use_velocity: bool = False) -> int:
@@ -56,11 +64,12 @@ def global_feature_dim(use_invincible: bool = False, use_boss: bool = False,
 
 def feature_dim(k_bullets: int = 16, use_velocity: bool = False, k_enemies: int = 0,
                 use_invincible: bool = False, use_boss: bool = False,
-                use_danger_grad: bool = False) -> int:
+                use_danger_grad: bool = False, use_wall_feat: bool = False) -> int:
     if k_bullets < 0 or k_enemies < 0:
         raise ValueError("k_bullets/k_enemies must be nonnegative")
     return (global_feature_dim(use_invincible, use_boss, use_danger_grad)
-            + k_bullets * bullet_feature_dim(use_velocity) + k_enemies * ENEMY_FEATURE_DIM)
+            + k_bullets * bullet_feature_dim(use_velocity) + k_enemies * ENEMY_FEATURE_DIM
+            + (WALL_FEATURE_DIM if use_wall_feat else 0))
 
 
 #: 危险梯度感知半径 (与规则老师的斥力核一致)
@@ -98,6 +107,108 @@ def _boss_xy(state: GameState) -> tuple[float | None, float | None]:
     return None, None
 
 
+def _wall_row(state: GameState, px: float, py: float) -> dict[str, Any] | None:
+    """找"最近一堵正在下压的弹幕墙"的几何 (连续口径, 不设开关阈值)。
+
+    与 :class:`~touhou_rl_mcp.training.hierarchical.WallDetector` 的区别: 判别器
+    要回答"切不切", 所以必须有硬阈值; 这里是**给策略看的连续量**, 不设阈值 ——
+    边界让策略自己学。
+
+    做法: 只看"匀速下落"的弹 (``vy >= 0.7`` 且 ``|vx| <= 0.9``), 取**最快到达自机**
+    的那一颗所在的横带 (``|Δy| <= 13``), 在带内算横向占用。
+    """
+    if not state.bullets:
+        return None
+    pos = np.asarray(state.bullets, dtype=np.float64).reshape(-1, 2)
+    raw = (state.raw or {}).get("bullet_velocity") or []
+    try:
+        vel = np.asarray(raw, dtype=np.float64).reshape(-1, 2)
+        if vel.shape[0] != pos.shape[0]:
+            raise ValueError
+    except (TypeError, ValueError):
+        return None
+    falling = (vel[:, 1] >= 0.7) & (np.abs(vel[:, 0]) <= 0.9)
+    if not falling.any():
+        return None
+    idx = np.flatnonzero(falling)
+    eta = (py - pos[idx, 1]) / np.maximum(vel[idx, 1], 1e-6)
+    near = (eta <= WALL_LOOKAHEAD) & (eta >= -12.0)
+    idx, eta = idx[near], eta[near]
+    if len(idx) < 4:
+        return None
+    head = int(np.argmin(eta))
+    y0 = float(pos[idx[head], 1])
+    row = idx[np.abs(pos[idx, 1] - y0) <= WALL_ROW_BAND / 2.0]
+    if len(row) < 4:
+        return None
+
+    xs = pos[row, 0]
+    band = np.clip((xs / PLAYFIELD_WIDTH * WALL_BANDS).astype(np.int64), 0, WALL_BANDS - 1)
+    occ = np.zeros(WALL_BANDS, dtype=np.float64)
+    occ[np.unique(band)] = 1.0
+    covered = float(occ.mean())
+
+    # 最大连续空带 = 缺口; 全占满时缺口宽度记 0
+    best_len = best_start = 0
+    run = 0
+    for i in range(WALL_BANDS):
+        if occ[i] < 0.5:
+            run += 1
+            if run > best_len:
+                best_len, best_start = run, i - run + 1
+        else:
+            run = 0
+    band_w = PLAYFIELD_WIDTH / WALL_BANDS
+    gap_w = best_len * band_w
+    gap_cx = (best_start + best_len / 2.0) * band_w if best_len else px
+    return {
+        "covered": covered,
+        "occ": occ,
+        "gap_cx": float(gap_cx),
+        "gap_w": float(gap_w),
+        "eta": float(eta[head]),
+        "count": int(len(row)),
+    }
+
+
+def wall_features(state: GameState, px: float | None = None,
+                  py: float | None = None) -> np.ndarray:
+    """12 维"墙特征", **追加在观测向量末尾** (见 :data:`WALL_FEATURE_DIM`)。
+
+    为什么需要它: 143 维观测里只有"最近 16 颗弹", 覆盖不到 ±70px 以外 ——
+    一堵 384px 宽、36 颗弹的墙在观测里只表现为"身边有十几颗朝下飞的弹",
+    **缺口在哪完全不可见**。所以无论怎么在墙段做监督, 策略都只能学到"别乱动"
+    (实测 `wall_gate` 552~657 步, 比基线 814 更差)。
+
+    这 12 维是"把看不见的东西写进观测":
+
+    ====== ====================================================
+    0      这一排的横向覆盖率 (0~1): 越高越"封死"
+    1      缺口中心相对自机的横向偏移 / 场地宽 (-1~1)
+    2      缺口宽度 / 场地宽
+    3      到达自机高度的帧数 / 180 (1 = 立刻到)
+    4..11  8 个列带 (48px) 的占用 (0/1)
+    ====== ====================================================
+
+    没有墙时全 0。**必须放在末尾**: checkpoint 的输入层可以零初始化扩维,
+    新列权重为 0 => 旧策略的函数完全不变, 再从零学这几列。
+    """
+    px = float(px) if px is not None else (
+        float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2)
+    py = float(py) if py is not None else (
+        float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32)
+    out = np.zeros(WALL_FEATURE_DIM, dtype=np.float64)
+    row = _wall_row(state, px, py)
+    if row is None:
+        return out
+    out[0] = row["covered"]
+    out[1] = float(np.clip((row["gap_cx"] - px) / PLAYFIELD_WIDTH, -1.0, 1.0))
+    out[2] = row["gap_w"] / PLAYFIELD_WIDTH
+    out[3] = float(np.clip(row["eta"] / WALL_LOOKAHEAD, 0.0, 1.0))
+    out[4:] = row["occ"]
+    return out
+
+
 def encode_state(
     state: GameState,
     *,
@@ -107,6 +218,7 @@ def encode_state(
     use_invincible: bool = False,
     use_boss: bool = False,
     use_danger_grad: bool = False,
+    use_wall_feat: bool = False,
     out: np.ndarray | None = None,
     validate: bool = True,
 ) -> np.ndarray:
@@ -129,7 +241,8 @@ def encode_state(
     if state.boss_hp is not None and state.boss_max_hp:
         boss_ratio = max(0.0, min(1.0, state.boss_hp / max(1.0, state.boss_max_hp)))
 
-    dim = feature_dim(k_bullets, use_velocity, k_enemies, use_invincible, use_boss, use_danger_grad)
+    dim = feature_dim(k_bullets, use_velocity, k_enemies, use_invincible, use_boss,
+                      use_danger_grad, use_wall_feat)
     vec = np.empty(dim, dtype=np.float64) if out is None else out
     vec[:GLOBAL_FEATURE_DIM] = (
         px / PLAYFIELD_WIDTH,                                   # 自机 x
@@ -217,6 +330,10 @@ def encode_state(
             eblock[:, 1] = edy[eidx] / PLAYFIELD_HEIGHT
             eblock[:, 2] = np.sqrt(ed2[eidx]) / 320.0
             eblock[:, 3] = 1.0
+
+    # 墙特征: **末尾** 12 维 (checkpoint 零初始化扩维依赖这个位置)
+    if use_wall_feat:
+        vec[dim - WALL_FEATURE_DIM:] = wall_features(state, px, py)
     return vec
 
 
@@ -229,14 +346,17 @@ def encode_frames(
     use_invincible: bool = False,
     use_boss: bool = False,
     use_danger_grad: bool = False,
+    use_wall_feat: bool = False,
 ) -> np.ndarray:
     out = np.empty((len(states), feature_dim(k_bullets, use_velocity, k_enemies,
-                                             use_invincible, use_boss, use_danger_grad)),
+                                             use_invincible, use_boss, use_danger_grad,
+                                             use_wall_feat)),
                    dtype=np.float64)
     for i, state in enumerate(states):
         encode_state(state, k_bullets=k_bullets, use_velocity=use_velocity,
                      k_enemies=k_enemies, use_invincible=use_invincible,
-                     use_boss=use_boss, use_danger_grad=use_danger_grad, out=out[i])
+                     use_boss=use_boss, use_danger_grad=use_danger_grad,
+                     use_wall_feat=use_wall_feat, out=out[i])
     return out
 
 
@@ -469,6 +589,11 @@ def gap_encoder(config: Any) -> GapObservation:
 
 def observation_dim(config: Any) -> int:
     """按 :class:`TrainConfig` 算出观测维度 (缺口 / 危险图 / 最近K弹三选一)。"""
+    if getattr(config, "use_wall_feat", False) and (
+            getattr(config, "use_gap", False) or getattr(config, "use_grid", False)):
+        # 墙特征目前只接在"最近 K 颗弹"这条口径上: 缺口/危险图各有自己的布局,
+        # 混用会让"末尾 12 维"的位置假设失效 (而 checkpoint 扩维正依赖这个位置)。
+        raise ValueError("use_wall_feat 只能与默认观测同用 (不支持 use_gap / use_grid)")
     if getattr(config, "use_gap", False):
         return gap_observation_dim(gap_spec_from(config))
     if getattr(config, "use_grid", False):
@@ -479,7 +604,8 @@ def observation_dim(config: Any) -> int:
         return grid_observation_dim(size, config.bullet_velocity, config.use_invincible,
                                     config.use_boss, config.use_danger_grad, scales=scales)
     return feature_dim(config.k_bullets, config.bullet_velocity, config.k_enemies,
-                       config.use_invincible, config.use_boss, config.use_danger_grad)
+                       config.use_invincible, config.use_boss, config.use_danger_grad,
+                       getattr(config, "use_wall_feat", False))
 
 
 class ObservationEncoder:
@@ -499,7 +625,7 @@ class ObservationEncoder:
                  grid_scales: str = "",
                  k_bullets: int = 16, bullet_velocity: bool = False, k_enemies: int = 0,
                  use_invincible: bool = False, use_boss: bool = False,
-                 use_danger_grad: bool = False,
+                 use_danger_grad: bool = False, use_wall_feat: bool = False,
                  use_gap: bool = False, gap_grid: bool = True, gap_geo: bool = True,
                  gap_clearance: bool = True, gap_prev_action: bool = True,
                  gap_action_age: bool = False, gap_action_age_cap: int = 12,
@@ -514,6 +640,7 @@ class ObservationEncoder:
         self.use_invincible = bool(use_invincible)
         self.use_boss = bool(use_boss)
         self.use_danger_grad = bool(use_danger_grad)
+        self.use_wall_feat = bool(use_wall_feat)
         self.use_gap = bool(use_gap)
         self.gap_grid = bool(gap_grid)
         self.gap_geo = bool(gap_geo)
@@ -537,6 +664,7 @@ class ObservationEncoder:
             use_invincible=bool(meta.get("use_invincible", False)),
             use_boss=bool(meta.get("use_boss", False)),
             use_danger_grad=bool(meta.get("use_danger_grad", False)),
+            use_wall_feat=bool(meta.get("use_wall_feat", False)),
             use_gap=bool(meta.get("use_gap", False)),
             gap_grid=bool(meta.get("gap_grid", True)),
             gap_geo=bool(meta.get("gap_geo", True)),
@@ -574,8 +702,9 @@ class ObservationEncoder:
             scales = ",".join(f"{s}x{s}/±{sp:g}" for s, sp in self.scales)
             return (f"ObservationEncoder(grid[{scales}] vel={self.bullet_velocity} "
                     f"dim={self.dim})")
+        wall = " wall" if self.use_wall_feat else ""
         return (f"ObservationEncoder(k_bullets={self.k_bullets} vel={self.bullet_velocity} "
-                f"k_enemies={self.k_enemies} dim={self.dim})")
+                f"k_enemies={self.k_enemies}{wall} dim={self.dim})")
 
 
 def encode_observation(state: GameState, config: Any,
@@ -588,6 +717,9 @@ def encode_observation(state: GameState, config: Any,
     的 one-hot 拼进观测 —— 宏动作有 6 帧承诺, 策略必须知道自己在往哪走。
     ``action_age`` 是"连续同向决策了多少步", 同样只对 ``use_gap`` 有效。
     """
+    if getattr(config, "use_wall_feat", False) and (
+            getattr(config, "use_gap", False) or getattr(config, "use_grid", False)):
+        raise ValueError("use_wall_feat 只能与默认观测同用 (不支持 use_gap / use_grid)")
     if getattr(config, "use_gap", False):
         return gap_encoder(config)(state, prev_action=prev_action, out=out,
                                    action_age=action_age)
@@ -613,5 +745,6 @@ def encode_observation(state: GameState, config: Any,
         use_invincible=config.use_invincible,
         use_boss=config.use_boss,
         use_danger_grad=config.use_danger_grad,
+        use_wall_feat=getattr(config, "use_wall_feat", False),
         out=out,
     )

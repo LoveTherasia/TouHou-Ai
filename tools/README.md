@@ -105,6 +105,7 @@
 | 脚本 | 用途 |
 |---|---|
 | `eval_policy.py` | 贪心评估已保存策略（不带探索） |
+| `pattern_bench.py` | **按弹型**分别评估：均值/最差/死亡数/伤害/对准（固定种子，验收用）；`--policy planner` 直接用可行域规划器打；`--hier-switch` 走分层切换 |
 | `watch_training.py` | 训练过程中的 Tkinter 实时监视窗口 |
 | `analyze_training_log.py` | 离线分析 `train.jsonl` / `steps.jsonl`，定位死因与动作偏好 |
 | `grid_preview.py` | 画出"危险图"观测，看清策略眼里的弹幕地图 |

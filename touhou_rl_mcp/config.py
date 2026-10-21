@@ -39,10 +39,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 对话快进: 东方是边沿触发, 需"连续点按 Z"; 每次按住 dialogue_tap_hold 帧,
     # 松开 dialogue_tap_after 帧, 一次 step 最多点 dialogue_max_taps 次。
     "dialogue_tap_hold": 2,
-    "dialogue_tap_after": 6,
-    "dialogue_max_taps": 12,
-    # 连续多少帧"空场"判定进入对话/静默期 (越小越快触发快进; 默认 25)
-    "dialogue_threshold_frames": 25,
+    "dialogue_tap_after": 3,
+    "dialogue_max_taps": 30,
+    # 连续多少帧"空场"判定进入对话/静默期 (越小越快触发快进; 默认 12)
+    "dialogue_threshold_frames": 12,
+    # 空场容忍的敌人上限: TH11 对话时剧本会留 1~2 个不攻击的演员,
+    # 真机实测关底对话窗口内 ``enemies_alive`` 是 1~2 而不是 0。
+    "dialogue_max_enemies": 2,
     # ---------------- 环境语义 ----------------
     # 一次 step 默认推进多少帧 (60fps)
     "step_frames": 4,
@@ -84,7 +87,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # ---------------- 奖励 ----------------
     # 唯一来源: config.json 的 reward 段直接覆盖这里 (工具/训练脚本不要再自带一套)
     "reward": {
-        "score_scale": 1e-5,  # Δscore * scale
+        "score_scale": 3e-2,  # Δscore * scale —— 攻击意图的主信号 (见 rl/reward.py "attack")
         "graze_scale": 0.02,  # Δgraze * scale
         "power_scale": 0.1,  # Δpower * scale
         "life_bonus": 5.0,  # 每多一残机
@@ -97,8 +100,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "boss_damage_scale": 0.1,  # -Δboss_hp * scale (需要 boss_hp)
         "invincible_output_scale": 0.0,  # 无敌期 分数/伤害/存活 缩放 (0=封堵被弹刷输出)
         "invincible_frames": 150,  # 回退推断无敌窗口 (真机未标定 invincible 时)
-        "danger_scale": 4.0,  # 危险度惩罚 (需要 player_x/y + 弹幕)
-        "danger_radius": 50.0,  # 危险度感知半径(像素)
+        # 危险度只做"微调": 实测 4.0/50px 时一局扣 -3306, 比其它所有项加起来还大 5 倍,
+        # 于是策略唯一的学习信号变成"离弹幕越远越好"(密集弹幕里 = 角落), 不再攻击。
+        "danger_scale": 0.8,  # 危险度惩罚 (需要 player_x/y + 弹幕)
+        "danger_radius": 32.0,  # 危险度感知半径(像素)
+        # 缺口余量的势函数塑形 (φ' − φ, 不改变最优策略); 0 = 关闭。
+        # 它是 WEIGHT_DOCS 里的一项, 必须在这里也有默认值, 否则 patch 校验会拒绝它。
+        "gap_margin_scale": 0.0,
         "alive_bonus": 0.3,  # 每 step 存活奖励
         "time_penalty": -0.01,  # 每 step 的固定惩罚, 鼓励速通
         "clip": 8000.0,  # 单步奖励裁剪 (None 表示不裁剪)
@@ -127,6 +135,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_hud": True,
         "trail_length": 180,  # 玩家轨迹保留帧数
     },
+    # ---------------- 视觉兜底 (capture/bullets.py) ----------------
+    # 没有弹幕偏移的作品 (th06~th14 中除 th11 之外) 可以打开它: 内存读不到弹幕时,
+    # 从**截图**里检测小亮块当作弹幕, 坐标换算成 384x448 场地坐标。
+    # 代价是每次 read_state 多一次截图 (毫秒级), 所以默认关闭; 它拿不到速度与半径。
+    "vision": {
+        "enabled": False,
+        "bright_thr": 170,  # 亮度阈值 (0~255)
+        "sat_thr": 40,      # 饱和度阈值, 用来排除灰白背景/文字
+        "min_area": 2,      # 连通域最小面积(像素)
+        "max_area": 300,    # 连通域最大面积, 用来排除背景花纹/敌机
+        "max_dim": 40,      # 连通域最大边长
+    },
     # ---------------- 自动查找游戏 ----------------
     "search_roots": ["F:\\", "E:\\", "D:\\", "C:\\"],
     "search_depth": 2,
@@ -153,6 +173,47 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+#: 允许任意键名的配置子树 (键名由使用方自己解释)。目前只有按键映射:
+#: ``control.keymap`` 的键是虚拟动作名, 无法穷举校验。
+FREEFORM_PATHS = frozenset({"control.keymap"})
+
+
+def _unknown_paths(patch: Any, schema: Any, prefix: str = "") -> list[str]:
+    """递归找出 ``patch`` 里 ``schema`` 不认识的键, 返回点分路径列表."""
+    if not isinstance(patch, dict) or not isinstance(schema, dict):
+        return []
+    found: list[str] = []
+    for key, value in patch.items():
+        path = f"{prefix}{key}"
+        if key not in schema:
+            found.append(path)
+            continue
+        if path in FREEFORM_PATHS:
+            continue
+        sub = schema[key]
+        if isinstance(sub, dict) and isinstance(value, dict):
+            found.extend(_unknown_paths(value, sub, f"{path}."))
+    return found
+
+
+def _check_shapes(patch: Any, schema: Any, prefix: str = "") -> None:
+    """结构校验: 配置段必须是对象 (不能让 ``patch({"reward": null})`` 把整段抹掉)."""
+    if not isinstance(patch, dict) or not isinstance(schema, dict):
+        return
+    for key, value in patch.items():
+        if key not in schema:
+            continue
+        path = f"{prefix}{key}"
+        expected = schema[key]
+        if not isinstance(expected, dict) or path in FREEFORM_PATHS:
+            continue
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"配置项 {path} 需要一个 JSON 对象, 收到 {type(value).__name__}"
+            )
+        _check_shapes(value, expected, f"{path}.")
 
 
 class Config:
@@ -196,12 +257,19 @@ class Config:
 
     # ------------------------------------------------------------------
     def patch(self, changes: dict[str, Any]) -> dict[str, Any]:
-        """深合并式更新, 返回更新后的完整配置."""
+        """深合并式更新, 返回更新后的完整配置.
+
+        校验是**递归**的: 未知的顶层项、未知的嵌套项、以及"段被写成非对象"
+        都会被拒绝。否则 ``{"reward": {"miss_penelty": -5}}`` 会先写进内存
+        (``save=True`` 时还会落盘), 直到下一帧 ``RewardModel.update_weights``
+        才抛错 —— 那时坏键已经存下来了。
+        """
         if not isinstance(changes, dict):
             raise ConfigError("patch 需要一个 JSON 对象")
-        unknown = [k for k in changes if k not in DEFAULT_CONFIG]
+        unknown = _unknown_paths(changes, DEFAULT_CONFIG)
         if unknown:
             raise ConfigError(f"未知的配置项: {', '.join(sorted(unknown))}")
+        _check_shapes(changes, DEFAULT_CONFIG)
         self._data = _deep_merge(self._data, changes)
         return self.as_dict()
 

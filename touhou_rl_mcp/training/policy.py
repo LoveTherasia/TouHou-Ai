@@ -152,6 +152,35 @@ class MLPPolicy:
     def logits_batch(self, X: np.ndarray) -> np.ndarray:
         return self._forward_batch(np.asarray(X, dtype=np.float64))[2]
 
+    def widen_input(self, new_dim: int) -> "MLPPolicy":
+        """把输入层从 ``obs_dim`` 扩到 ``new_dim``: **新列权重为 0**。
+
+        为什么是零: 记忆里旧策略的每一列权重都对应一个旧特征, 新特征追加在观测
+        **末尾**, 所以只要把新列置 0, 扩展后的网络对旧观测的输出**逐位相同** ——
+        等于"从原策略出发, 再学会用新的几列", 而不是从头训。
+
+        Adam 的一阶/二阶矩同步扩维 (新列为 0): 否则新列的动量会从旧列的尺度起步,
+        一上来就把原策略冲坏。
+        """
+        new_dim = int(new_dim)
+        if new_dim < self.obs_dim:
+            raise ValueError(f"只能扩维: new_dim={new_dim} < obs_dim={self.obs_dim}")
+        if new_dim == self.obs_dim:
+            return self
+        old = self.obs_dim
+        W0 = np.zeros((self.W[0].shape[0], new_dim), dtype=self.W[0].dtype)
+        W0[:, :old] = self.W[0]
+        m0 = np.zeros_like(W0)
+        v0 = np.zeros_like(W0)
+        m0[:, :old] = self._m[0]
+        v0[:, :old] = self._v[0]
+        self.W[0] = W0
+        self._m[0] = m0
+        self._v[0] = v0
+        self.obs_dim = new_dim
+        self._params = [*self.W, *self.b, self.Wv, self.bv]
+        return self
+
     def snapshot_params(self) -> list[np.ndarray]:
         """冻结一份当前参数, 作为 RL 微调的参考策略 (KL 锚)。"""
         return [p.copy() for p in self._params]
@@ -505,11 +534,20 @@ class MLPPolicy:
         weights: np.ndarray | None = None,
         entropy_coef: float | None = None,
         grad_clip: float = 5.0,
+        ref_params: list[np.ndarray] | None = None,
+        kl_coef: float = 0.0,
     ) -> dict[str, float]:
         """行为克隆 (向量化): 加权交叉熵拟合 ``actions``。
 
         ``weights`` 用于**对危险状态加权** (例如离弹幕很近、刚掉残的样本),
         让策略优先学会在这些"示范里少见但致命"的状态下怎么做。
+
+        ``actions < 0`` 表示**该行没有标签**, 只参与 KL 锚 (不参与交叉熵)。这是给
+        "分层老师"用的: 它只在墙段出标签, 其余步弃权; 此时若不加锚, 共享隐层会被
+        墙段的标签整体拉走, 常规弹型的能力直接崩掉 (实测平均存活 1852 -> 901 步)。
+
+        ``ref_params`` + ``kl_coef``: 对**无标签行**加 ``kl_coef * KL(p_ref || p)``,
+        梯度是 ``kl_coef * (p - p_ref) / m`` —— 语义就是"没有监督的地方别动"。
         """
         X = np.asarray(obs_batch, dtype=np.float64)
         a = np.asarray(actions, dtype=np.int64)
@@ -524,22 +562,40 @@ class MLPPolicy:
             if w.shape[0] != m:
                 w = np.ones(m, dtype=np.float64)
             w = np.maximum(w, 0.0)
-        wsum = float(w.sum()) or 1.0
-        wscale = (w / wsum)[:, None]
+        valid = a >= 0
+        if not bool(valid.any()):
+            # 整批都没有标签: 只剩 KL 锚 (等价于把策略拉回参考分布)
+            w_ce = np.zeros(m, dtype=np.float64)
+        else:
+            w_ce = w * valid.astype(np.float64)
+        wsum = float(w_ce.sum()) or 1.0
+        wscale = (w_ce / wsum)[:, None]
+        a_ce = np.where(valid, a, 0)
 
         activations, _zs, logits = self._forward_batch(X)
         h_last = activations[-1]
         probs = self._softmax_rows(logits)
         row = np.arange(m)
-        logp = np.log(np.maximum(probs[row, a], 1e-12))
+        logp = np.log(np.maximum(probs[row, a_ce], 1e-12))
         entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), axis=1)
-        loss = float((w * (-logp)).sum() / wsum)
+        loss = float((w_ce * (-logp)).sum() / wsum)
 
         # dL/dlogits = w*(p - onehot) + coef*w*p*(log p + H)  (按样本权重缩放)
         grad_logits = probs.copy()
-        grad_logits[row, a] -= 1.0
+        grad_logits[row, a_ce] -= 1.0
         grad_logits += coef * probs * (np.log(np.maximum(probs, 1e-12)) + entropy[:, None])
         grad_logits *= wscale
+
+        kl_mean = 0.0
+        if ref_params is not None and kl_coef > 0.0 and bool((~valid).any()):
+            ref_logits = self._logits_with_params(X, ref_params)
+            q = self._softmax_rows(ref_logits)
+            kl_rows = np.sum(q * (np.log(np.maximum(q, 1e-12))
+                                  - np.log(np.maximum(probs, 1e-12))), axis=1)
+            mask = (~valid).astype(np.float64)
+            n_kl = float(mask.sum()) or 1.0
+            grad_logits += (kl_coef / n_kl) * mask[:, None] * (probs - q)
+            kl_mean = float((mask * kl_rows).sum() / n_kl)
 
         grads: list[np.ndarray] = [np.zeros_like(p) for p in self._params]
         gW = grads[: len(self.W)]
@@ -564,6 +620,8 @@ class MLPPolicy:
             "imitation_loss": round(loss, 6),
             "entropy": round(float((w * entropy).sum() / wsum), 6),
             "grad_norm": round(total, 6),
+            "labeled": int(valid.sum()),
+            "kl_base": round(kl_mean, 6),
         }
 
     def _adam_step(self, grads: list[np.ndarray]) -> None:

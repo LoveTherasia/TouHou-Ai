@@ -28,6 +28,10 @@ class SpawnEvent:
     y: float
     vx: float
     vy: float
+    #: 这颗弹存活了多少帧 (0 = 一直到录制结束都没消失 / 无法确定)。
+    #: 没有它, mock 里的弹**永远不会消失** —— 同屏弹数会从 1k 涨到 16k,
+    #: 环境会退化成"恒定 900 颗静态弹海"。
+    life: int = 0
 
 
 class DanmakuRecorder:
@@ -44,6 +48,9 @@ class DanmakuRecorder:
         self.prev: dict[int, tuple[float, float]] = {}
         self.pending: dict[int, tuple[int, float, float]] = {}
         self.spawns: list[SpawnEvent] = []
+        #: 槽位 -> 在 spawns 里的下标 / 出生帧 (消失时用来回填 life)
+        self._spawn_index: dict[int, int] = {}
+        self._birth: dict[int, int] = {}
         self.frame = 0
         self.dropped = 0
         self.tick = 0
@@ -87,6 +94,8 @@ class DanmakuRecorder:
                 if abs(vx) <= self.max_speed and abs(vy) <= self.max_speed:
                     self.spawns.append(SpawnEvent(f0, round(x0, 2), round(y0, 2),
                                                   round(vx, 3), round(vy, 3)))
+                    self._spawn_index[slot] = len(self.spawns) - 1
+                    self._birth[slot] = f0
                     new += 1
                 else:
                     self.dropped += 1
@@ -98,6 +107,15 @@ class DanmakuRecorder:
         for slot, (x, y) in cur.items():
             if slot not in self.prev:
                 self.pending[slot] = (frame, x, y)
+
+        # 3) 本帧消失的槽位 -> 回填存活帧数
+        for slot in self.prev:
+            if slot in cur:
+                continue
+            idx = self._spawn_index.pop(slot, None)
+            birth = self._birth.pop(slot, None)
+            if idx is not None and birth is not None:
+                self.spawns[idx].life = max(1, frame - birth)
 
         self.prev = cur
         self.frame = frame
@@ -118,7 +136,8 @@ class DanmakuRecorder:
             "frames": max(1, self.frame),
             "count": len(self.spawns),
             "dropped": self.dropped,
-            "spawns": [[e.frame, e.x, e.y, e.vx, e.vy] for e in self.spawns],
+            # 第 6 列是存活帧数 (mock 用它给 Bullet.life); 末端未消失的弹记 0
+            "spawns": [[e.frame, e.x, e.y, e.vx, e.vy, e.life] for e in self.spawns],
         }
 
     def save(self, path: str | Path, *, game: str = "th11", fps: int = 60,
@@ -137,10 +156,15 @@ def load_script(path: str | Path) -> dict[str, Any]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     spawns = data.get("spawns", [])
     base = min((int(r[0]) for r in spawns), default=0)
-    by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
+    by_frame: dict[int, list[tuple]] = {}
     for row in spawns:
         f = int(row[0]) - base
-        by_frame.setdefault(f, []).append((float(row[1]), float(row[2]), float(row[3]), float(row[4])))
+        # 第 5 个字段 (可选) 是该弹的寿命帧数; 录制端不记"弹什么时候消失",
+        # 只能靠它给"永远留在场上"的弹一个上限 (见 tools/fix_danmaku.py --max-life)。
+        item = (float(row[1]), float(row[2]), float(row[3]), float(row[4]))
+        if len(row) > 5:
+            item = item + (int(row[5]),)
+        by_frame.setdefault(f, []).append(item)
     data["by_frame"] = by_frame
     data["frame_base"] = base
     #: 脚本可循环的帧长度

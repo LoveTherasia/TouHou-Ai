@@ -435,10 +435,12 @@ class MockGame:
         if not self.scripted or not self.script_len:
             return
         frame = (self.frame + self.script_offset) % self.script_len
-        for x, y, vx, vy in self.script_by_frame.get(frame, ()):
+        for row in self.script_by_frame.get(frame, ()):
             if len(self.bullets) >= MAX_BULLETS:
                 break
-            self.bullets.append(Bullet(x=x, y=y, vx=vx, vy=vy))
+            x, y, vx, vy = row[:4]
+            life = int(row[4]) if len(row) > 4 else 0
+            self.bullets.append(Bullet(x=x, y=y, vx=vx, vy=vy, life=life))
 
     def _update_bullets(self) -> None:
         alive: list[Bullet] = []

@@ -7,15 +7,29 @@
   4. 质心像素 -> 游戏内部坐标: internal = pixel / crop_scale + origin。
 
 注意: 视觉拿不到速度, 也可能把"道具(P/B/F 方块)"误当成弹幕; 需要时用颜色/形状再过滤。
+
+接入点: ``backends/memory.py`` 在 ``vision.enabled=true`` 且内存里读不到弹幕
+(该作品没有弹幕偏移, 或实体读取报错) 时调用 :func:`bullets_from_frame`。
+默认关闭 —— 每次读数多一次截图, 真机 60fps 训练时开销明显。
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-__all__ = ["connected_components", "detect_blobs", "detect_bullets", "annotate", "find_hitbox"]
+if TYPE_CHECKING:  # pragma: no cover - 只为类型提示, 避免运行时循环导入
+    from ..games.registry import GameSpec
+
+__all__ = [
+    "annotate",
+    "bullets_from_frame",
+    "connected_components",
+    "detect_blobs",
+    "detect_bullets",
+    "find_hitbox",
+]
 
 #: th11 内部坐标 = 场地内像素 + (32,32) (由 player_x/y 标定反推, 可被 hitbox 标定覆盖)
 DEFAULT_ORIGIN = (32.0, 32.0)
@@ -136,10 +150,42 @@ def detect_bullets(
     origin: tuple[float, float] = DEFAULT_ORIGIN,
     **kwargs: Any,
 ) -> list[tuple[float, float]]:
-    """检测弹幕并换算成游戏内部坐标 [(x, y), ...]。"""
+    """检测**已裁剪的场地**并换算成游戏内部坐标 [(x, y), ...].
+
+    ``origin`` 是"场地在窗口内的偏移", 输出是**窗口系**坐标 (东方正作内部坐标系)。
+    要和 ``memory/entities.py`` 的实体坐标 (384x448 场地系) 混用, 请走
+    :func:`bullets_from_frame` —— 它负责裁剪并把原点归零。
+    """
     blobs = detect_blobs(image, **kwargs)
     ox, oy = origin
     return [(bl["x"] / crop_scale + ox, bl["y"] / crop_scale + oy) for bl in blobs]
+
+
+def bullets_from_frame(
+    image: Image.Image,
+    spec: "GameSpec",
+    *,
+    playfield: list[int] | None = None,
+    window_size: list[int] | None = None,
+    **kwargs: Any,
+) -> list[tuple[float, float]]:
+    """从**整窗截图**里检测弹幕, 返回 384x448 场地坐标.
+
+    与 :func:`detect_bullets` 的区别: 先按 ``spec.playfield`` 裁出场地, 再做检测。
+    裁剪后原点就是场地左上角, 所以 ``origin=(0, 0)``、``crop_scale = 裁剪宽 / 384``。
+    这样得到的坐标与 ``memory/entities.py`` 的实体坐标在同一个坐标系里,
+    ``dodge`` 宏 / 危险度奖励 / 可视化都能直接混用。
+    """
+    from ..types import PLAYFIELD_WIDTH
+    from .screenshot import crop_playfield
+
+    box = playfield if playfield is not None else list(getattr(spec, "playfield", []) or [])
+    size = window_size if window_size is not None else getattr(spec, "window_size", None)
+    cropped = crop_playfield(image, box or [32, 16, 416, 464], size)
+    if cropped.width <= 0:
+        return []
+    scale = cropped.width / PLAYFIELD_WIDTH
+    return detect_bullets(cropped, crop_scale=scale or 1.0, origin=(0.0, 0.0), **kwargs)
 
 
 def find_hitbox(image: Image.Image, *, bright: int = 150) -> tuple[float, float] | None:

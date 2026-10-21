@@ -87,7 +87,8 @@ class TouhouEnv:
         self._episode_frames = 0
         self._started = False
         self._dialogue = DialogueAssist(
-            threshold=int(self.config.get("dialogue_threshold_frames", 25) or 25)
+            threshold=int(self.config.get("dialogue_threshold_frames", 12) or 12),
+            max_enemies=int(self.config.get("dialogue_max_enemies", 2) or 0),
         )
         #: 紧急放弹保护 (规则): 只在最近弹幕极近时放弹
         bg = self.config.section("bomb_guard")
@@ -149,7 +150,8 @@ class TouhouEnv:
             self.start()
         state = self.backend.reset(options=dict(options))
         self._dialogue = DialogueAssist(
-            threshold=int(self.config.get("dialogue_threshold_frames", 25) or 25)
+            threshold=int(self.config.get("dialogue_threshold_frames", 12) or 12),
+            max_enemies=int(self.config.get("dialogue_max_enemies", 2) or 0),
         )
         self._bomb_guard.reset()
         self._bullet_tracker.reset()

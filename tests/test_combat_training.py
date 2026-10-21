@@ -47,8 +47,8 @@ class TestCombat(unittest.TestCase):
     def test_dialogue_requires_valid_sustained_empty_field(self):
         assist=DialogueAssist()
         s=state()
-        self.assertFalse(assist.update(s,20))   # 20 < 阈值 25, 还不算对话
-        self.assertTrue(assist.update(s,10))    # 累计 30 >= 25
+        self.assertFalse(assist.update(s,8))    # 8 < 阈值 12, 还不算对话
+        self.assertTrue(assist.update(s,6))     # 累计 14 >= 12
         s.bullet_count=1
         self.assertFalse(assist.update(s,60))
         s.bullet_count=0

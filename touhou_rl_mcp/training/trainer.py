@@ -31,6 +31,11 @@ from .gap_label import update_action_age
 from .journal import Journal
 from .policy import MLPPolicy
 
+#: 判定"自机在 Boss 火力线上"的横向容差 (像素)。
+#: mock 的伤害窗口是 22px, 真机正作的散射更宽; 这里只作为**诊断指标**,
+#: 不参与奖励计算, 所以取一个略宽的 24px。
+ALIGN_TOLERANCE = 24.0
+
 #: 9 个方向 (空字符串 = 原地不动)
 DIRECTIONS: list[str] = [
     "",
@@ -129,6 +134,12 @@ class TrainConfig:
     use_danger_grad: bool = False
     #: 观测改用"危险图" (以自机为中心) 而不是"最近 K 颗弹的一维向量"
     use_grid: bool = False
+    #: 观测末尾追加 12 维"墙特征" (覆盖率/缺口中心/缺口宽度/到达帧数/8 列占用)。
+    #: 需要弹速; 只能与默认观测同用 (不与 use_gap / use_grid 混用)。
+    use_wall_feat: bool = False
+    #: 载入旧 checkpoint 时**零初始化扩维**输入层 (新列权重 0 => 函数不变)。
+    #: 用途: 给已有策略加上"墙特征"再继续训, 而不是从头学。
+    expand_input: bool = False
     #: 观测改用"未来占用栅格 + 几何缺口" (见 training/occupancy.py)。
     #: 这是密集弹幕下唯一能让策略提前横向占位的表示; 需要弹速 (mock 直接提供)。
     use_gap: bool = False
@@ -183,6 +194,10 @@ class TrainConfig:
     kl_anchor: float = 0.0
     #: 模仿学习每个 batch 重复几次梯度 (BC/DAgger 收敛更快)
     teacher_epochs: int = 8
+    #: 对**无标签步**的 KL 锚系数 (>0 时只要求"这些地方别动")。
+    #: 分层老师只在墙段出标签, 不加锚时共享隐层会被墙段标签整体拉走:
+    #: 实测平均存活 1852 -> 901 步, 常规弹型对准率 90% -> 5%。
+    kl_base: float = 0.0
     #: 危险状态加权: 离最近弹幕越近, 模仿损失权重越大 (0=不加权)
     danger_weight: float = 0.0
     #: 加权时的"危险半径"(像素)
@@ -195,6 +210,40 @@ class TrainConfig:
     teacher: str = ""
     #: DAgger 模式下每步用老师动作接管的比例 (0=全策略驱动, 1=等价纯模仿)
     dagger_beta: float = 0.2
+    # ---- score / score_dagger 老师 (按奖励排序打标签) ----
+    #: 安全阈值(px): 未来 H 步内最小弹幕间距低于它的方向直接出局
+    score_safety_margin: float = 12.0
+    #: 对齐窗口(px): |自机 x − 目标 x| 小于它算"在火力线上"
+    score_align_tol: float = 20.0
+    #: 滞回: 新方向要比保持当前方向好这么多才切换 (减少左右互搏)
+    score_commit_margin: float = 0.0
+    # ---- hybrid / hybrid_dagger 老师 (力场先验 + 分数重排) ----
+    #: 力场先验权重: 与"满对准收益(约 11)"同量级才起作用; 越大越像 rule 老师
+    hybrid_prior_weight: float = 2.5
+    #: 软安全屏障权重: clearance 归零时的惩罚。25 已经大过满对准收益(11.4),
+    #: 再大(100)会把人往角落赶, 实测存活反而掉一半。
+    hybrid_barrier_weight: float = 25.0
+    #: 对准收益的估计窗口(帧), 默认与安全窗口同长; 拉长会牺牲存活 (见 sweep 记录)
+    hybrid_align_horizon: float = 22.0
+    #: 直线弹幕墙的前瞻帧数 (0=关闭)。60 能让 wall_gate 从 546 撑到 1320 步,
+    #: 代价是 stage1 从 4770 掉到 3813 —— 属于"专用"开关, 不要默认开
+    hybrid_wall_horizon: float = 0.0
+    # ---- viability / 可行域规划器老师 ----
+    #: 规划视野(帧): 必须 >= 墙从生成到压到自机高度的时间(约 150)
+    planner_horizon: int = 180
+    #: 规划器每层几帧 (2 => 网格 4.4px, 与自机速度精确对齐)
+    planner_dt: int = 2
+    #: 规划器的对准偏好: 在所有同样安全的位置里挑离 Boss 那列最近的。
+    #: 实测 0.15 把对准率从 0~20% 提到 61~92%, 存活一步不掉 (见 VIABILITY_PLANNER.md)
+    planner_aim_weight: float = 0.15
+    # ---- 分层切换 (策略 <-> 规划器) ----
+    #: 评测/演示时开分层切换: 检测到"整幅横墙 / 多向收网"就改问规划器
+    hier_switch: bool = False
+    #: 墙段内沿用上次规划方向的步数 (规划器一次 25~40ms, 逐帧算训练会慢到不可用)
+    hier_replan_every: int = 1
+    #: 每局轮换的弹型 (空=用 config.danmaku_pattern)。写在 TrainConfig 里是因为
+    #: "只蒸墙段"必须固定打墙型, 而"不遗忘"又必须混入常规弹型 —— 两者只能靠轮换。
+    pattern_cycle: list[str] = field(default_factory=list)
     seed: int = 20261017
     eval_every: int = 25
     eval_episodes: int = 3
@@ -253,6 +302,30 @@ class EpisodeRecord:
     shot: int = 0
     #: 本局各动作被选中的次数 (便于看它爱用什么动作 / 有没有放弹)
     actions: dict[str, int] = field(default_factory=dict)
+    #: 本局起始分数; ``score_gain = max_score - start_score``
+    start_score: int = 0
+    #: 对 Boss 造成的总伤害 (符卡切换回血不算; 用来判断"有没有在打")
+    boss_damage: int = 0
+    #: 与 Boss 同列 (|Δx| <= ALIGN_TOLERANCE) 的步数, 以及 Boss 在场的步数
+    aligned_steps: int = 0
+    boss_steps: int = 0
+    #: 分层切换: 有多少步交给了规划器, 以及最后一次触发的原因 (curtain/encircle)
+    planner_steps: int = 0
+    switch_reason: str = ""
+
+    @property
+    def score_gain(self) -> int | None:
+        """本局净增分数 —— "打中敌人"在 mock 里直接体现在分数上。"""
+        if self.max_score is None:
+            return None
+        return self.max_score - self.start_score
+
+    @property
+    def align_ratio(self) -> float | None:
+        """站在 Boss 火力线上的步数占比 (无 Boss 时为 None)."""
+        if not self.boss_steps:
+            return None
+        return round(self.aligned_steps / self.boss_steps, 3)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -264,6 +337,7 @@ class EpisodeRecord:
             "return": round(self.return_, 3),
             "max_stage": self.max_stage,
             "max_score": self.max_score,
+            "score_gain": self.score_gain,
             "max_power": self.max_power,
             "total_graze": self.total_graze,
             "misses": self.misses,
@@ -271,6 +345,10 @@ class EpisodeRecord:
             "cleared": self.cleared,
             "game_over": self.game_over,
             "truncated": self.truncated,
+            "boss_damage": self.boss_damage,
+            "align_ratio": self.align_ratio,
+            "planner_steps": self.planner_steps,
+            "switch_reason": self.switch_reason,
             "duration_s": round(self.duration_s, 3),
             "steps_per_sec": round(self.steps / self.duration_s, 1) if self.duration_s > 0 else None,
             "reward_parts": {k: round(v, 4) for k, v in self.reward_parts.items()},
@@ -327,6 +405,28 @@ class Trainer:
 
         self.action_table = build_action_table(use_focus=self.config.use_focus,
                                                use_bomb=self.config.use_bomb)
+        #: KL 锚的参考参数 (监督阶段第一次更新前冻结; load() 之后也正确)
+        self._base_params: list[Any] | None = None
+        #: 零初始化扩维前的观测维度 (None = 没有扩维)
+        self.expanded_from: int | None = None
+        #: 分层切换 (评测/演示): 检测到墙段时把决策交给可行域规划器。
+        #: 规划器只在墙段被调用, 所以平均开销很低 (墙段外 0 成本)。
+        self._hier_detector = None
+        self._hier_planner = None
+        #: 墙段的"承诺期"状态: 沿用上次方向 hier_replan_every 步再重算
+        self._hier_active = False
+        self._hier_age = 0
+        self._hier_dir = 0
+        if self.config.hier_switch:
+            from .hierarchical import WallDetector
+            from .viability import ViabilityPlanner
+
+            self._hier_detector = WallDetector()
+            self._hier_planner = ViabilityPlanner(
+                horizon=int(self.config.planner_horizon),
+                dt=int(self.config.planner_dt),
+                aim_weight=float(self.config.planner_aim_weight),
+            )
         self._action_counts: dict[str, int] = {}
         self.journal = Journal(self.out_dir, log_steps=self.config.log_steps)
         self.obs_dim = observation_dim(self.config)
@@ -389,6 +489,11 @@ class Trainer:
         self.error = None
         self.started_at = time.perf_counter()
         self.finished_at = None
+        # 直接以"无老师 + KL 锚"启动 (常见于: 载入蒸馏好的策略再来 PPO 微调) 时,
+        # 不会发生 teacher -> "" 的切换, 必须在开跑前冻结参考策略, 否则 kl_anchor
+        # 静默失效 —— 这正是"PPO 把 DAgger 打崩"的一个隐蔽原因。
+        self.apply_hyperparams()
+        self._capture_rl_reference()
         self._thread = threading.Thread(target=self._loop, name="touhou-trainer", daemon=True)
         self._thread.start()
         return self.status()
@@ -418,6 +523,22 @@ class Trainer:
     # ------------------------------------------------------------------
     # 在线调参
     # ------------------------------------------------------------------
+    def _capture_rl_reference(self) -> None:
+        """冻结 RL 阶段的参考策略 (KL 锚的锚点).
+
+        触发时机只有两个: ``start()`` 时就已经没有老师 (直接 PPO 微调已蒸馏的
+        策略), 或者 ``reconfigure`` 把老师摘掉的那一刻。抓早了是随机初始策略,
+        抓晚了已经被 RL 改过 —— 两种都会让 ``kl_anchor`` 悄悄失效。
+        """
+        if self._rl_ref is not None:
+            return
+        if float(getattr(self.config, "kl_anchor", 0.0)) <= 0.0:
+            return
+        if str(getattr(self.config, "teacher", "") or "").strip():
+            return
+        with self.policy_lock:
+            self._rl_ref = self.policy.snapshot_params()
+
     def reconfigure(self, patch: dict[str, Any]) -> dict[str, Any]:
         """修改训练超参; 需要重建网络的项 (hidden/k_bullets/use_focus) 会重建策略。"""
         new_config = TrainConfig.from_dict({**self.config.to_dict(), **patch})
@@ -447,13 +568,13 @@ class Trainer:
         self.config = new_config
         # 从"有老师"切到"没老师" = 进入 RL 阶段: 此刻冻结参考策略, 给 PPO 一个锚。
         # 必须在这一刻抓, 抓早了是随机的初始策略, 抓晚了已经被 RL 改过。
-        if (patch.get("teacher") is not None and not str(new_config.teacher).strip()
-                and self.config.kl_anchor > 0):
-            with self.policy_lock:
-                self._rl_ref = self.policy.snapshot_params()
+        if patch.get("teacher") is not None:
+            self._capture_rl_reference()
         self.policy.lr = new_config.lr
         self.policy.entropy_coef = new_config.entropy_coef
         if rebuild:
+            # 观测/动作维度变了 -> 参数形状变了, 旧锚必须作废, 否则形状不匹配
+            self._rl_ref = None
             self.action_table = build_action_table(use_focus=new_config.use_focus,
                                                    use_bomb=new_config.use_bomb)
             self.obs_dim = observation_dim(new_config)
@@ -544,6 +665,23 @@ class Trainer:
         lo, hi = float(bounds[0]), float(bounds[1])
         cfg.patch({"danmaku_offset": int(self._rng.uniform(lo, hi) * length)})
 
+    def _apply_pattern(self, index: int, config: "TrainConfig") -> None:
+        """每局按 ``pattern_cycle`` 轮换弹型 (mock 后端)。
+
+        为什么必须轮换: 只蒸 ``wall_gate`` 会把通才策略的常规躲避冲掉
+        (灾难性遗忘), 而混着练又需要"这一局是哪一种"可控。``MockBackend.reset``
+        每次都读 ``config.danmaku_pattern`` 重建弹型, 所以这里改配置就够了。
+        """
+        cycle = [str(p) for p in (getattr(config, "pattern_cycle", None) or []) if str(p)]
+        if not cycle:
+            return
+        cfg = getattr(self.env, "config", None)
+        if cfg is None:
+            return
+        name = cycle[index % len(cycle)]
+        if str(cfg.get("danmaku_pattern") or "") != name:
+            cfg.patch({"danmaku_pattern": name})
+
     def _run_episode(
         self, index: int, *, greedy: bool = False
     ) -> tuple[EpisodeRecord, "Trajectory" | None]:
@@ -551,6 +689,7 @@ class Trainer:
         character, shot = (divmod((index-1) % 6, 3) if config.rotate_loadouts
                            else (config.character, config.shot))
         with self.env_lock:
+            self._apply_pattern(index, config)
             self._apply_script_offset(config)
             result = self.env.reset(seed=config.seed + index, difficulty=config.difficulty,
                                     character=character, shot=shot,
@@ -581,6 +720,9 @@ class Trainer:
             recorder = DanmakuRecorder()
         record.character, record.shot = character, shot
         started = time.perf_counter()
+        #: 攻击意图的诊断量: 净增分数 / Boss 伤害 / 对准率 (见 EpisodeRecord)
+        record.start_score = int(state.score) if state.score is not None else 0
+        hp_prev = state.boss_hp
         act_counts: dict[str, int] = {}
         teacher = (config.teacher or "").strip().lower()
         guard = None
@@ -599,11 +741,61 @@ class Trainer:
                 guard = GapTeacher(gap_spec_from(config), mode=config.gap_label,
                                    commit_frames=config.gap_commit_frames,
                                    hysteresis=config.gap_hysteresis)
+            elif teacher in {"score", "score_dagger"}:
+                from .score_teacher import ScoreTeacher
+
+                # 把**当前奖励权重**交给老师: score_scale 变了, 标签就会变。
+                reward_weights = dict(self.env.config.section("reward"))
+                guard = ScoreTeacher(
+                    weights=reward_weights,
+                    safety_margin=float(getattr(config, "score_safety_margin", 12.0)),
+                    align_tol=float(getattr(config, "score_align_tol", 20.0)),
+                    commit_margin=float(getattr(config, "score_commit_margin", 0.0)),
+                )
+            elif teacher in {"planner", "viability"}:
+                from .viability import ViabilityPlanner
+
+                # 注意: 每次决策 20~40ms, 只适合"小样本示范/离线打标签",
+                # 不适合几千步的 DAgger (会慢到不可用)。
+                guard = ViabilityPlanner(
+                    horizon=int(getattr(config, "planner_horizon", 180)),
+                    dt=int(getattr(config, "planner_dt", 2)),
+                    aim_weight=float(getattr(config, "planner_aim_weight", 0.15)),
+                )
+            elif teacher in {"hier", "hier_dagger"}:
+                from .hierarchical import HierarchicalTeacher
+                from .viability import ViabilityPlanner
+
+                # 分层: 只在"整幅横墙 / 多向收网"的步打标签, 其余弃权。
+                # 弃权 = 不产生梯度, 策略在常规局面保持原样 (避免灾难性遗忘)。
+                guard = HierarchicalTeacher(
+                    planner=ViabilityPlanner(
+                        horizon=int(getattr(config, "planner_horizon", 180)),
+                        dt=int(getattr(config, "planner_dt", 2)),
+                        aim_weight=float(getattr(config, "planner_aim_weight", 0.15)),
+                    ),
+                    replan_every=int(getattr(config, "hier_replan_every", 1)),
+                )
+            elif teacher in {"hybrid", "hybrid_dagger"}:
+                from .hybrid_teacher import HybridTeacher
+
+                # 力场先验 (与 rule 同源) + 分数重排 (吃 reward 权重) + 软安全屏障
+                guard = HybridTeacher(
+                    weights=dict(self.env.config.section("reward")),
+                    safety_margin=float(getattr(config, "score_safety_margin", 12.0)),
+                    align_tol=float(getattr(config, "score_align_tol", 20.0)),
+                    commit_margin=float(getattr(config, "score_commit_margin", 0.0)),
+                    prior_weight=float(getattr(config, "hybrid_prior_weight", 2.5)),
+                    barrier_weight=float(getattr(config, "hybrid_barrier_weight", 25.0)),
+                    align_horizon=float(getattr(config, "hybrid_align_horizon", 22.0)),
+                    wall_horizon=float(getattr(config, "hybrid_wall_horizon", 0.0)),
+                )
         # DAgger: 由**策略自己**驱动游戏(带 beta 概率混入老师动作保证覆盖),
         # 但每步都用老师对其**实际访问到的状态**打标签 -> 修正 BC 的分布漂移。
         # 纯模仿 (guard/rule/gap) 时 beta=1, 完全由老师接管。
         dagger_beta = (float(getattr(config, "dagger_beta", 0.2))
-                       if teacher in {"dagger", "rule_dagger", "gap_dagger"} else 1.0)
+                       if teacher in {"dagger", "rule_dagger", "gap_dagger",
+                                      "score_dagger", "hybrid_dagger", "hier_dagger"} else 1.0)
         # 记录"上一动作"的方向下标; 缺口观测要靠它表达宏动作的承诺方向
         prev_dir = -1
         #: 连续同向决策步数 (给观测里的 action_age 维; 推理时同样可从自己的动作算)
@@ -619,10 +811,32 @@ class Trainer:
             if self._stop.is_set():
                 break
             if greedy:
-                with self.policy_lock:
-                    action = self.policy.greedy(obs)
-                    value = self.policy.value(obs)
-                logp = 0.0
+                obs_for_action = obs
+                if self._hier_detector is not None and self._hier_planner is not None:
+                    metrics = self._hier_detector.detect(state)
+                    if metrics.switched:
+                        self._hier_age += 1
+                        if (not self._hier_active
+                                or self._hier_age > max(1, int(self.config.hier_replan_every))):
+                            info = self._hier_planner.plan(state)
+                            self._hier_dir = int(info.direction)
+                            self._hier_age = 1
+                        self._hier_active = True
+                        action = min(self._hier_dir, len(self.action_table) - 1)
+                        record.planner_steps += 1
+                        record.switch_reason = metrics.reason
+                        with self.policy_lock:
+                            value = self.policy.value(obs_for_action)
+                        logp = 0.0
+                        obs_for_action = None
+                    else:
+                        self._hier_active = False
+                        self._hier_age = 0
+                if obs_for_action is not None:
+                    with self.policy_lock:
+                        action = self.policy.greedy(obs_for_action)
+                        value = self.policy.value(obs_for_action)
+                    logp = 0.0
             else:
                 with self.policy_lock:
                     action, logp, value = self.policy.sample(obs, self._rng)
@@ -632,9 +846,13 @@ class Trainer:
             if guard is not None:
                 try:
                     teacher_action, _tinfo = guard.choose(state, state.frame, self.action_table[action])
-                    label = self._teacher_index(teacher_action)
-                    if teacher == "guard" or self._rng.random() < dagger_beta:
-                        exec_action = label          # 老师接管(beta=1 时等价于纯模仿)
+                    # 老师返回空动作 = **弃权** (分层老师只在墙段出标签)。此时必须
+                    # 保持 label=None: 若把"策略自己的动作"当标签, 交叉熵等于
+                    # "让它对自己更自信", 会压掉熵并固化坏习惯。
+                    if teacher_action:
+                        label = self._teacher_index(teacher_action)
+                        if teacher == "guard" or self._rng.random() < dagger_beta:
+                            exec_action = label      # 老师接管(beta=1 时等价于纯模仿)
                 except Exception:
                     label = None
             action_name = self.action_table[exec_action]
@@ -650,9 +868,19 @@ class Trainer:
 
             # Dialogue pulses override sampled movement: do not label that
             # outcome as a policy action (would bias the policy gradient).
-            if not step.info.get("dialogue_assist") and (guard is None or label is not None):
+            # kl_base > 0 时, 分层老师弃权的步也要留下来 —— 它们不进交叉熵,
+            # 只用来把策略"钉"在基座分布上。
+            keep_unlabeled = (guard is not None and label is None
+                              and float(getattr(config, "kl_base", 0.0)) > 0.0)
+            if not step.info.get("dialogue_assist") and (
+                    guard is None or label is not None or keep_unlabeled):
                 observations.append(obs)
-                actions.append(label if label is not None else action)
+                if label is not None:
+                    actions.append(label)
+                elif guard is None:
+                    actions.append(action)
+                else:
+                    actions.append(-1)      # 无标签: 只参与 KL 锚
                 logps.append(float(logp))
                 values.append(value)
                 rewards.append(float(step.reward))
@@ -666,6 +894,20 @@ class Trainer:
             record.steps += 1
             record.frames += int(step.info.get("frames") or 0)
             record.return_ += float(step.reward)
+            # 攻击意图: 打掉的血 / 是否站在 Boss 火力线上 (与 reward 无关, 只做诊断)
+            if state.boss_hp is not None and hp_prev is not None:
+                hurt = hp_prev - state.boss_hp
+                if 0 < hurt < 500:  # 符卡切换/换面会把 hp 抬高, 不算伤害
+                    record.boss_damage += hurt
+            hp_prev = state.boss_hp
+            boss_pos = (state.raw or {}).get("boss_position")
+            if state.boss_hp is not None and state.player_x is not None and boss_pos:
+                record.boss_steps += 1
+                try:
+                    if abs(float(state.player_x) - float(boss_pos[0])) <= ALIGN_TOLERANCE:
+                        record.aligned_steps += 1
+                except (TypeError, ValueError):
+                    pass
             for key, value_part in (step.info.get("reward_parts") or {}).items():
                 record.reward_parts[key] = round(record.reward_parts.get(key, 0.0) + value_part, 6)
 
@@ -830,13 +1072,23 @@ class Trainer:
             epochs = max(1, int(getattr(self.config, "teacher_epochs", 8)))
             mb = max(64, int(getattr(self.config, "ppo_minibatch", 256)))
             rng = np.random.default_rng(self.config.seed + len(self.episodes))
+            kl_coef = float(getattr(self.config, "kl_base", 0.0) or 0.0)
+            ref = None
+            if kl_coef > 0.0 and bool((A < 0).any()):
+                # 第一次更新前冻结参考参数: 此时还没被这批梯度改过
+                if self._base_params is None:
+                    self._base_params = self.policy.snapshot_params()
+                ref = self._base_params
             stats: dict[str, float] = {}
             for _ in range(epochs):
                 order = rng.permutation(len(X))
                 for start in range(0, len(X), mb):
                     idx = order[start:start + mb]
                     with self.policy_lock:
-                        stats = self.policy.imitate_batch(X[idx], A[idx], weights=W[idx])
+                        stats = self.policy.imitate_batch(
+                            X[idx], A[idx], weights=W[idx],
+                            ref_params=ref, kl_coef=kl_coef,
+                        )
             return stats
 
         gamma = self.config.gamma
@@ -942,11 +1194,17 @@ class Trainer:
     def _gae(traj: Trajectory, gamma: float, lam: float,
              *, scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
         rewards = np.asarray(traj.rewards, dtype=np.float64) / scale
-        values = np.asarray(traj.values, dtype=np.float64) / scale
+        # 价值头学的是**缩放后**的回报 (见 _ppo_step: 目标 ret 也来自这里), 所以
+        # values / bootstrap **不能**再除一次 scale。
+        #
+        # 历史 bug: 这里把 values 也除以 scale, 于是基准被压到 ~1/scale (≈0),
+        # 优势退化成"逐步即时奖励", 策略只贪当前一步 —— 表现为"躲开了眼前的弹、
+        # 却不站位输出、很快被后续弹幕打死", 正是 PPO 微调必崩的直接原因之一。
+        values = np.asarray(traj.values, dtype=np.float64)
         dones = traj.dones if len(traj.dones) == len(rewards) else [False] * len(rewards)
         n = len(rewards)
         adv = np.zeros(n, dtype=np.float64)
-        next_value = float(traj.bootstrap_value) / scale
+        next_value = float(traj.bootstrap_value)
         last = 0.0
         for t in range(n - 1, -1, -1):
             nonterminal = 0.0 if dones[t] else 1.0
@@ -1113,13 +1371,37 @@ class Trainer:
         if not npz.exists():
             raise FileNotFoundError(f"找不到策略文件: {npz}")
         loaded = MLPPolicy.load(npz)
+        expand = bool(self.config.expand_input)
+        if (expand and loaded.obs_dim < self.obs_dim
+                and loaded.n_actions == len(self.action_table)):
+            # 零初始化扩维: 新特征必须在观测**末尾** (use_wall_feat 就是这么接的)。
+            # 扩展后函数与原策略逐位相同, 所以"加上墙特征"不会先破坏已有能力。
+            old = loaded.obs_dim
+            loaded.widen_input(self.obs_dim)
+            self.expanded_from = old
         if loaded.obs_dim != self.obs_dim or loaded.n_actions != len(self.action_table):
-            raise ValueError("Checkpoint observation/action dimensions do not match training config")
+            hint = ""
+            if loaded.obs_dim != self.obs_dim:
+                hint = (f" (checkpoint={loaded.obs_dim}, 本配置={self.obs_dim}; "
+                        f"若加了 use_wall_feat 请加 --expand-input, "
+                        f"否则请让 use_wall_feat/危险梯度等开关与 checkpoint 一致)")
+            raise ValueError("Checkpoint observation/action dimensions do not match "
+                            f"training config{hint}")
         self.policy = loaded
         self.config.hidden = self.policy.hidden
         self.action_table = build_action_table(use_focus=self.config.use_focus,
                                               use_bomb=self.config.use_bomb)
+        # 用**本次 run** 的超参覆盖 checkpoint 里自带的 lr / entropy。
+        # 不覆盖会出现"命令行写 --lr 3e-5, 实际按 checkpoint 的 1e-3 更新"的静默 bug ——
+        # 实测它让所有 PPO 微调都以 10~30 倍学习率跑, 三组"调小 lr"的实验完全没生效,
+        # 结果全都把 DAgger 的策略打崩。
+        self.apply_hyperparams()
         return self.policy.describe()
+
+    def apply_hyperparams(self) -> None:
+        """把当前 config 的 lr / entropy 同步到策略对象上 (load / start 时都要)."""
+        self.policy.lr = float(self.config.lr)
+        self.policy.entropy_coef = float(self.config.entropy_coef)
 
     def clear_history(self) -> None:
         with self._state_lock:
