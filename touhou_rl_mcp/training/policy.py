@@ -550,7 +550,21 @@ class MLPPolicy:
         梯度是 ``kl_coef * (p - p_ref) / m`` —— 语义就是"没有监督的地方别动"。
         """
         X = np.asarray(obs_batch, dtype=np.float64)
-        a = np.asarray(actions, dtype=np.int64)
+        A = np.asarray(actions)
+        # 软标签: ``actions`` 是 ``(N, n_actions)`` 的目标分布。
+        # 为什么需要它: 规划器(MPC/CEM)在"多个动作同样安全"时 argmax 会随机挑,
+        # 实测老师与自己的一致率只有 ~25%、相邻帧 50~77% 会换动作 —— 硬标签
+        # 等于让学生拟合噪声。把"每个动作的代价"变成分布再蒸馏就没有这个问题
+        # (代价接近的动作目标概率也接近, 梯度不冲突)。
+        soft: np.ndarray | None = None
+        if A.ndim == 2:
+            soft = np.maximum(A.astype(np.float64), 0.0)
+            row_sum = soft.sum(axis=1)
+            good = row_sum > 1e-9
+            soft[good] /= row_sum[good, None]
+            a = np.argmax(soft, axis=1).astype(np.int64)
+        else:
+            a = A.astype(np.int64)
         m = X.shape[0]
         if m == 0:
             return {"imitation_loss": 0.0, "entropy": 0.0, "grad_norm": 0.0}
@@ -562,7 +576,7 @@ class MLPPolicy:
             if w.shape[0] != m:
                 w = np.ones(m, dtype=np.float64)
             w = np.maximum(w, 0.0)
-        valid = a >= 0
+        valid = (soft.sum(axis=1) > 1e-9) if soft is not None else (a >= 0)
         if not bool(valid.any()):
             # 整批都没有标签: 只剩 KL 锚 (等价于把策略拉回参考分布)
             w_ce = np.zeros(m, dtype=np.float64)
@@ -576,14 +590,21 @@ class MLPPolicy:
         h_last = activations[-1]
         probs = self._softmax_rows(logits)
         row = np.arange(m)
-        logp = np.log(np.maximum(probs[row, a_ce], 1e-12))
-        entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), axis=1)
-        loss = float((w_ce * (-logp)).sum() / wsum)
-
-        # dL/dlogits = w*(p - onehot) + coef*w*p*(log p + H)  (按样本权重缩放)
-        grad_logits = probs.copy()
-        grad_logits[row, a_ce] -= 1.0
-        grad_logits += coef * probs * (np.log(np.maximum(probs, 1e-12)) + entropy[:, None])
+        if soft is not None:
+            target = np.where(valid[:, None], soft, 0.0)
+            logp = np.log(np.maximum(probs[row, a_ce], 1e-12))
+            nll = -np.sum(target * np.log(np.maximum(probs, 1e-12)), axis=1)
+            entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), axis=1)
+            loss = float((w_ce * nll).sum() / wsum)
+            grad_logits = probs - target
+        else:
+            logp = np.log(np.maximum(probs[row, a_ce], 1e-12))
+            entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-12)), axis=1)
+            loss = float((w_ce * (-logp)).sum() / wsum)
+            grad_logits = probs.copy()
+            grad_logits[row, a_ce] -= 1.0
+        grad_logits = grad_logits + coef * probs * (
+            np.log(np.maximum(probs, 1e-12)) + entropy[:, None])
         grad_logits *= wscale
 
         kl_mean = 0.0
@@ -623,6 +644,371 @@ class MLPPolicy:
             "labeled": int(valid.sum()),
             "kl_base": round(kl_mean, 6),
         }
+
+    def fit_cost(
+        self,
+        obs_batch: np.ndarray,
+        cost_batch: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        temp: float = 20.0,
+        clip: float = 8.0,
+        grad_clip: float = 5.0,
+    ) -> dict[str, float]:
+        """**cost-to-go 回归**蒸馏: 输出层直接回归 ``-相对代价 / temp``。
+
+        为什么不是"再来一种软标签"
+        ------------------------
+        ``imitate_batch`` 的软目标是 ``softmax(-cost/T)``，损失是交叉熵，梯度是
+        ``p − target``。代价差一旦超过几倍 T，target 就饱和成 one-hot，梯度随之
+        归零 —— 学生只知道"这个动作最差"，不知道"差多少"，也学不到"现在整体有多
+        危险"。这里改成对 **logits** 做 MSE：
+
+            target_logit(a) = -clip((cost(a) − min cost) / T, 0, clip)
+
+        梯度是线性的 ``(logits − target)``，不会饱和；同时因为 logits 与
+        ``softmax`` 共享语义，学生 argmax 就等于自己 argmin cost-to-go ——
+        这正是"蒸馏价值函数、让学生自己决策"，而不是"模仿老师这一帧选了谁"。
+
+        ``cost_batch`` 里 ``NaN`` 的行（那一步老师弃权/算失败）直接跳过。
+        返回里带 ``agree``：学生 argmax 与老师 argmin 的一致率，这是蒸馏是否
+        真的把排序学过去的直接指标。
+        """
+        X = np.asarray(obs_batch, dtype=np.float64)
+        C = np.asarray(cost_batch, dtype=np.float64)
+        if X.ndim != 2 or C.ndim != 2 or X.shape[0] != C.shape[0]:
+            return {"cost_loss": 0.0, "agree": 0.0, "labeled": 0}
+        valid = np.isfinite(C).all(axis=1)
+        m = int(valid.sum())
+        if m == 0:
+            return {"cost_loss": 0.0, "agree": 0.0, "labeled": 0}
+        Xv, Cv = X[valid], C[valid]
+        rel = Cv - Cv.min(axis=1, keepdims=True)
+        target = -np.clip(rel / max(1e-6, float(temp)), 0.0, max(0.0, float(clip)))
+        if weights is None:
+            w = np.ones(m, dtype=np.float64)
+        else:
+            w = np.asarray(weights, dtype=np.float64).reshape(-1)
+            w = np.ones(m, dtype=np.float64) if w.shape[0] != X.shape[0] else w[valid]
+            w = np.maximum(w, 0.0)
+        wsum = float(w.sum()) or 1.0
+
+        activations, _zs, logits = self._forward_batch(Xv)
+        h_last = activations[-1]
+        diff = logits - target
+        loss = float((w * np.sum(diff * diff, axis=1)).sum() / (2.0 * wsum))
+        agree = float(np.mean(np.argmax(logits, axis=1) == np.argmin(Cv, axis=1)))
+        mae = float((w * np.mean(np.abs(diff), axis=1)).sum() / wsum)
+
+        grad_logits = (w[:, None] * diff) / wsum
+        grads: list[np.ndarray] = [np.zeros_like(p) for p in self._params]
+        gW = grads[: len(self.W)]
+        gb = grads[len(self.W): 2 * len(self.W)]
+        gW[-1] += grad_logits.T @ h_last
+        gb[-1] += grad_logits.sum(axis=0)
+        delta = grad_logits @ self.W[-1]
+        for layer in range(len(self.W) - 2, -1, -1):
+            delta = delta * (activations[layer + 1] > 0)
+            gW[layer] += delta.T @ activations[layer]
+            gb[layer] += delta.sum(axis=0)
+            if layer > 0:
+                delta = delta @ self.W[layer]
+
+        total = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads)))
+        if grad_clip and total > grad_clip:
+            scale = grad_clip / (total + 1e-8)
+            for g in grads:
+                g *= scale
+        self._adam_step(grads)
+        return {
+            "cost_loss": round(loss, 6),
+            "cost_mae": round(mae, 6),
+            "agree": round(agree, 4),
+            "labeled": m,
+            "grad_norm": round(total, 6),
+        }
+
+    def fit_rank(
+        self,
+        obs_batch: np.ndarray,
+        cost_batch: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        margin: float = 20.0,
+        grad_clip: float = 5.0,
+    ) -> dict[str, float]:
+        """**并列感知的排序蒸馏**：把"并列最优"的那一组动作当成同一个答案。
+
+        为什么不是回归、也不是成对 RankNet
+        ---------------------------------
+        老师代价向量里 **74~78% 的帧"最优与次优完全并列"**（都是"足够安全"），
+        其余动作的相对代价动辄 300+（除以温度后全部撞截断）。于是：
+
+        * **回归**的目标实际只有 {0, −截断} 两个值 —— 没有连续信息，还会把
+          "并列的几个动作"当成"必须有一个赢"，学生只能靠浮点误差决定 argmax；
+        * **成对 RankNet**（只拿 argmin 当正例）会让并列组里没被选中的那个得不到
+          强化，实测并列的两个 logits 被拉开 **1.1**，等于偷偷把"并列"改成了
+          "必须挑第一个"。
+
+        所以这里直接把并列组当**一个目标的全部质量**：
+
+            good(s) = { a : cost(s,a) ≤ min_a cost + margin }        # 并列最优集合
+            target  = 均匀分布在 good(s) 上，其余动作 0
+            loss    = CE(softmax(logits), target)
+
+        差在 ``margin`` 以内的一律视为同样好（这是"并列感知"的全部含义）；
+        超过 ``margin`` 的动作只要求"别被选中"，不要求它们之间的相对顺序。
+        对称性天然成立（并列组内共享同一份质量），不会出现"谁先谁占便宜"。
+
+        ``margin`` 用代价单位：默认 20 ≈ 老师眼里"值得为此换方向"的程度。
+        返回 ``rank_acc``（选中并列组内动作的比例）与 ``agree``（严格 argmin 一致率）。
+        """
+        X = np.asarray(obs_batch, dtype=np.float64)
+        C = np.asarray(cost_batch, dtype=np.float64)
+        if X.ndim != 2 or C.ndim != 2 or X.shape[0] != C.shape[0]:
+            return {"rank_loss": 0.0, "rank_acc": 0.0, "agree": 0.0, "labeled": 0}
+        valid = np.isfinite(C).all(axis=1)
+        rows = np.nonzero(valid)[0]
+        n = int(rows.size)
+        if n == 0:
+            return {"rank_loss": 0.0, "rank_acc": 0.0, "agree": 0.0, "labeled": 0}
+
+        Cv = C[rows]
+        best = Cv.min(axis=1, keepdims=True)
+        good = (Cv <= best + max(0.0, float(margin))).astype(np.float64)
+        target = good / np.maximum(1e-9, good.sum(axis=1, keepdims=True))
+
+        if weights is None:
+            w = np.ones(n, dtype=np.float64)
+        else:
+            w = np.asarray(weights, dtype=np.float64).reshape(-1)
+            w = np.ones(X.shape[0], dtype=np.float64) if w.shape[0] != X.shape[0] else w[rows]
+            w = np.maximum(w, 0.0)
+        wsum = float(w.sum()) or 1.0
+
+        activations, _zs, logits = self._forward_batch(X)
+        h_last = activations[-1]
+        probs = self._softmax_rows(logits)
+        logp = np.log(np.maximum(probs[rows], 1e-12))
+        loss = float(-(w * (target * logp).sum(axis=1)).sum() / wsum)
+        picked = np.argmax(logits[rows], axis=1)
+        rank_acc = float(np.mean(good[np.arange(n), picked] > 0.5))
+        agree = float(np.mean(picked == np.argmin(Cv, axis=1)))
+
+        grad_logits = np.zeros_like(logits)
+        grad_logits[rows] = (probs[rows] - target) * (w / wsum)[:, None]
+
+        grads: list[np.ndarray] = [np.zeros_like(p) for p in self._params]
+        gW = grads[: len(self.W)]
+        gb = grads[len(self.W): 2 * len(self.W)]
+        gW[-1] += grad_logits.T @ h_last
+        gb[-1] += grad_logits.sum(axis=0)
+        delta = grad_logits @ self.W[-1]
+        for layer in range(len(self.W) - 2, -1, -1):
+            delta = delta * (activations[layer + 1] > 0)
+            gW[layer] += delta.T @ activations[layer]
+            gb[layer] += delta.sum(axis=0)
+            if layer > 0:
+                delta = delta @ self.W[layer]
+
+        total = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads)))
+        if grad_clip and total > grad_clip:
+            scale = grad_clip / (total + 1e-8)
+            for g in grads:
+                g *= scale
+        self._adam_step(grads)
+        good_mean = float(good.sum(axis=1).mean())
+        return {
+            "rank_loss": round(loss, 6),
+            "rank_acc": round(rank_acc, 4),
+            "agree": round(agree, 4),
+            "good_mean": round(good_mean, 2),
+            "labeled": n,
+            "grad_norm": round(total, 6),
+        }
+
+    def fit_listmle(
+        self,
+        obs_batch: np.ndarray,
+        cost_batch: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        margin: float = 20.0,
+        candidates: int = 0,
+        seed: int = 0,
+        posreg: np.ndarray | None = None,
+        posreg_weight: float = 0.0,
+        grad_clip: float = 5.0,
+    ) -> dict[str, float]:
+        """**tie-aware ListMLE**：在"同一状态的一组候选动作"上做 listwise 排序学习。
+
+        为什么是 listwise，而不是 §11 的"并列组 CE"
+        --------------------------------------------
+        并列组 CE 只用了 **"哪些动作属于最优组"** 这一个 bit —— 组外动作之间的
+        好坏次序全部丢掉了。可老师其实知道完整的次序（代价差 300 和差 30 不是一回事），
+        listwise 把整条排序都用上，样本效率更高：同一个状态不只告诉你"该往左"，
+        还告诉你"往左 > 往下 > 往右"。
+
+        tie-aware 的关键：**组内不连乘**
+        ---------------------------------
+        标准 ListMLE 是 ``P = ∏_k e^{s_k} / Σ_{j≥k} e^{s_j}``（逐元素连乘）。直接
+        套用会把并列组内的元素也排出先后 —— 这就是 §11.2 那个成对 RankNet 的坑
+        （并列的两个 logits 被拉开 1.1）。这里改成**按组连乘**：
+
+            P = ∏_g  (Σ_{i∈g} e^{s_i}) / (Σ_{j∈g 及其后} e^{s_j})
+            loss = −Σ_g [ LSE(s_g) − LSE(s_{g 之后的所有组}) ]
+
+        组 g 只通过**它内部的和**参与 loss，组内元素梯度完全相同 → 对称性天然成立。
+        两个边界都对：全部并列时只剩一组，``LSE(全) − LSE(全) = 0``，loss 与梯度
+        双双为 0（不会乱推）；严格无并列时退化成标准 ListMLE。
+
+        候选动作采样
+        ------------
+        ``candidates=K>0`` 时每个状态只随机取 K 个动作（**必含 argmin**），其余
+        不参与 loss。这既省算力，也让每轮覆盖不同的负例（负采样）；``K=0`` 表示
+        用全部动作。
+
+        ``posreg`` (``(N, n_actions)``) 是**位置正则**：每个动作一个非负权重，损失
+        加 ``w·Σ_a p_a·reg_a``。贴顶时对"继续向上"给正值，直接压住"越贴越贴"的
+        退化 —— 老师那边已经有位置偏好（``mpc.top_weight``），这一项是学生侧的
+        兜底，因为学生只看到 32 颗最近的弹，未必能自己推出"上面没路"。
+        """
+        X = np.asarray(obs_batch, dtype=np.float64)
+        C = np.asarray(cost_batch, dtype=np.float64)
+        empty = {"listmle_loss": 0.0, "rank_acc": 0.0, "agree": 0.0,
+                 "labeled": 0, "groups": 0.0}
+        if X.ndim != 2 or C.ndim != 2 or X.shape[0] != C.shape[0]:
+            return empty
+        valid = np.isfinite(C).all(axis=1)
+        rows = np.nonzero(valid)[0]
+        n = int(rows.size)
+        if n == 0:
+            return empty
+
+        Cv = C[rows]
+        n_act = Cv.shape[1]
+        rng = np.random.default_rng(int(seed))
+
+        keep = np.ones((n, n_act), dtype=bool)
+        if 0 < int(candidates) < n_act:
+            keep[:] = False
+            best0 = np.argmin(Cv, axis=1)
+            keep[np.arange(n), best0] = True
+            for r in range(n):
+                others = np.nonzero(np.arange(n_act) != best0[r])[0]
+                k = min(int(candidates) - 1, others.size)
+                if k > 0:
+                    keep[r, rng.choice(others, size=k, replace=False)] = True
+        counts = keep.sum(axis=1).astype(np.int64)
+
+        pad = float(Cv.max()) + 1e7
+        order = np.argsort(np.where(keep, Cv, pad), axis=1, kind="stable")
+        srt_cost = np.take_along_axis(np.where(keep, Cv, pad), order, axis=1)
+        pos = np.arange(n_act, dtype=np.int64)[None, :]
+        in_play = pos < counts[:, None]
+        new_grp = np.ones((n, n_act), dtype=bool)
+        if n_act > 1:
+            gap = srt_cost[:, 1:] - srt_cost[:, :-1]
+            new_grp[:, 1:] = (gap > float(margin)) | (pos[:, 1:] >= counts[:, None])
+        gid = np.cumsum(new_grp & in_play, axis=1) - 1
+        gid = np.where(in_play, gid, -1)
+        n_grp = int(gid.max()) + 1
+
+        activations, _zs, logits = self._forward_batch(X)
+        srt_s = np.take_along_axis(logits[rows], order, axis=1)
+        shift = np.where(in_play, srt_s, -1e9).max(axis=1, keepdims=True)
+        e = np.exp(np.clip(srt_s - shift, -60.0, 0.0)) * in_play
+
+        gmask = (gid[:, :, None] == np.arange(n_grp)[None, None, :]) * in_play[:, :, None]
+        Zg = np.einsum("nag,na->ng", gmask.astype(np.float64), e)
+        Zt = np.cumsum(Zg[:, ::-1], axis=1)[:, ::-1]
+        present = Zg > 0.0
+        log_zg = np.log(np.maximum(Zg, 1e-30))
+        log_zt = np.log(np.maximum(Zt, 1e-30))
+        loss_rows = -(np.where(present, log_zg - log_zt, 0.0)).sum(axis=1)
+
+        if weights is None:
+            w = np.ones(n, dtype=np.float64)
+        else:
+            w = np.asarray(weights, dtype=np.float64).reshape(-1)
+            w = np.ones(n, dtype=np.float64) if w.shape[0] != X.shape[0] else w[rows]
+            w = np.maximum(w, 0.0)
+        wsum = float(w.sum()) or 1.0
+        wn = w / wsum
+
+        inv_g = 1.0 / np.maximum(Zg, 1e-30)
+        pref = np.cumsum(1.0 / np.maximum(Zt, 1e-30), axis=1)
+        gsel = np.where(gid >= 0, gid, 0)
+        pref_p = np.take_along_axis(pref, gsel, axis=1) * in_play
+        invg_p = np.take_along_axis(inv_g, gsel, axis=1) * in_play
+        grad_s = e * (pref_p - invg_p) * wn[:, None]
+        # 组内梯度均摊：这一步是这个损失能不能用的关键。
+        # ``loss`` 本身对组内顺序**不变**（组只通过 Σe^s 参与），但它的梯度
+        # ∝ e^{s_t} 仍带着每个元素自己的分数 —— 直接把 grad_naive 用下去，
+        # 并列组里分数高的那个会被越推越高。实测并列的两个动作梯度差 35 倍，
+        # 与 §11.2 的成对 RankNet 是同一个坑（loss 对称 ≠ 梯度对称）。
+        # 在组内取均值 = 把整组当成**一个**决策单元：总推力守恒
+        # （Σ_t 均值 = Σ_t grad_naive），而组内每个元素拿到的梯度完全相同。
+        gm_f = gmask.astype(np.float64)
+        gsum = np.einsum("nag,na->ng", gm_f, grad_s)
+        gavg = gsum / np.maximum(gm_f.sum(axis=1), 1.0)
+        grad_s = np.take_along_axis(gavg, gsel, axis=1) * in_play
+
+        grad_rows = np.empty_like(srt_s)
+        np.put_along_axis(grad_rows, order, grad_s, axis=1)
+
+        loss = float((wn * loss_rows).sum())
+        cost_terms = None
+        if posreg is not None and float(posreg_weight) > 0.0:
+            reg = np.asarray(posreg, dtype=np.float64)[rows]
+            if reg.shape == logits[rows].shape:
+                probs = self._softmax_rows(logits[rows])
+                cost_terms = (probs * reg).sum(axis=1, keepdims=True)
+                grad_rows = grad_rows + float(posreg_weight) * probs * (reg - cost_terms)
+                loss += float(posreg_weight) * float(cost_terms.mean())
+
+        grad_logits = np.zeros_like(logits)
+        grad_logits[rows] = grad_rows
+        total = self._backprop_logits(activations, grad_logits, grad_clip)
+
+        picked = np.argmax(logits[rows], axis=1)
+        best_grp = np.where(present, np.arange(n_grp)[None, :], n_grp).min(axis=1)
+        # argmax 落在"排序后的第几个位置"→ 该位置所属组；等于最优组才算 rank_acc
+        pick_pos = np.argmax(srt_s, axis=1)
+        picked_gid = np.where(in_play, gid, -1)[np.arange(n), pick_pos]
+        rank_acc = float(np.mean(picked_gid == best_grp))
+        agree = float(np.mean(picked == np.argmin(Cv, axis=1)))
+        return {
+            "listmle_loss": round(loss, 6),
+            "rank_acc": round(rank_acc, 4),
+            "agree": round(agree, 4),
+            "labeled": n,
+            "groups": round(float(present.sum(axis=1).mean()), 3),
+            "grad_norm": round(total, 6),
+        }
+
+    def _backprop_logits(self, activations: list[np.ndarray],
+                         grad_logits: np.ndarray, grad_clip: float = 5.0) -> float:
+        """从 ``dL/dlogits`` 反传到所有参数并更新一步 Adam，返回梯度范数。"""
+        grads: list[np.ndarray] = [np.zeros_like(p) for p in self._params]
+        gW = grads[: len(self.W)]
+        gb = grads[len(self.W): 2 * len(self.W)]
+        gW[-1] += grad_logits.T @ activations[-1]
+        gb[-1] += grad_logits.sum(axis=0)
+        delta = grad_logits @ self.W[-1]
+        for layer in range(len(self.W) - 2, -1, -1):
+            delta = delta * (activations[layer + 1] > 0)
+            gW[layer] += delta.T @ activations[layer]
+            gb[layer] += delta.sum(axis=0)
+            if layer > 0:
+                delta = delta @ self.W[layer]
+        total = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads)))
+        if grad_clip and total > grad_clip:
+            scale = grad_clip / (total + 1e-8)
+            for g in grads:
+                g *= scale
+        self._adam_step(grads)
+        return total
 
     def _adam_step(self, grads: list[np.ndarray]) -> None:
         self._t += 1

@@ -33,6 +33,12 @@ WEIGHT_DOCS: dict[str, str] = {
     "time_penalty": "每个 step 的固定惩罚, 鼓励速通",
     "gap_margin_scale": ("缺口余量的势函数塑形: 奖励 += scale * (φ' - φ), φ = 自机所在车道"
                          "的安全余量。势函数不改变最优策略, 只给'站着不动'一个密集负梯度"),
+    "progress_scale": ("进度奖励: Δ(Boss 血量比) * scale —— 明确奖励「往前打」, "
+                       "与存活项区分开, 避免策略把「活着」当成唯一目标"),
+    "position_scale": ("位置偏好: 每步按「离理想站位多远」给分。理想站位 = 略低于中线 + "
+                       "与 Boss 同列; 越贴边扣得越多。它治的是「贴底横移也能活满 2000 步」"),
+    "position_y_target": "位置偏好的理想 y (归一化, 0=场地顶, 1=场地底; 默认 0.85)",
+    "position_edge": "贴边判定的像素阈值 (默认 28px)",
     "clip": "单步奖励裁剪上限 (null 表示不裁剪)",
     "shaping_scale": "所有分量的整体缩放, Agent 在线调参入口",
 }
@@ -90,6 +96,36 @@ REWARD_PROFILES: dict[str, dict[str, float]] = {
     #      攻击收益, 所以"用命换分"依然不划算。
     "attack": {
         "score_scale": 3e-2,
+        "boss_damage_scale": 0.1,
+        "danger_scale": 0.8,
+        "danger_radius": 32.0,
+        "alive_bonus": 0.3,
+        "time_penalty": -0.01,
+        "graze_scale": 0.02,
+        "miss_penalty": -200.0,
+        "death_penalty": -600.0,
+        "stage_clear_bonus": 1500.0,
+        "game_clear_bonus": 6000.0,
+        "spell_capture_bonus": 20.0,
+        "spell_clear_bonus": 150.0,
+        "life_bonus": 5.0,
+        "power_scale": 0.1,
+        "invincible_output_scale": 0.0,
+        "clip": 8000.0,
+        "shaping_scale": 1.0,
+    },
+    # 多目标: 存活 + 进度 + 分数 + 位置偏好
+    #
+    # 与 attack 档的区别只有两点:
+    #   1. 有独立的"进度"项 (打掉 Boss 血量), 不再完全依赖 score 的间接信号;
+    #   2. 有"位置偏好"项, 把"贴底横移/缩在角落"这种苟活行为变成负分。
+    # 存活仍是第一优先级: miss -200 / death -600 不动。
+    "multi": {
+        "score_scale": 3e-2,
+        "progress_scale": 6.0,
+        "position_scale": 0.5,
+        "position_y_target": 0.85,
+        "position_edge": 28.0,
         "boss_damage_scale": 0.1,
         "danger_scale": 0.8,
         "danger_radius": 32.0,
@@ -210,6 +246,21 @@ class RewardModel:
         if cur.raw.get("spell_cleared"):
             parts["spell_clear"] = self._w("spell_clear_bonus")
 
+        # 进度项: Boss 血量比的下降 (与 boss_damage 分开, 归一化后与血量上限无关)
+        progress = 0.0
+        if (prev is not None and prev.boss_hp is not None and cur.boss_hp is not None
+                and prev.boss_max_hp and cur.boss_max_hp):
+            before = prev.boss_hp / max(1.0, prev.boss_max_hp)
+            after = cur.boss_hp / max(1.0, cur.boss_max_hp)
+            if before >= after:
+                progress += (before - after) * self._w("progress_scale") * output_scale
+        if progress:
+            parts["progress"] = progress
+
+        position = self._position_pref(cur)
+        if position:
+            parts["position"] = position
+
         parts["alive"] = 0.0 if cur.raw.get("dialogue_assist") else self._w("alive_bonus") * output_scale
         parts["time"] = self._w("time_penalty")
         danger = self._danger(cur)
@@ -289,6 +340,40 @@ class RewardModel:
         if previous is None or prev is None or frame < prev_frame:
             return 0.0
         return scale * (phi - previous)
+
+    # ------------------------------------------------------------------
+    def _position_pref(self, state: GameState) -> float:
+        """位置偏好: 惩罚贴边/贴底, 奖励"站在 Boss 下方、略低于中线"。
+
+        密集弹幕里"离弹越远越好"会把策略推到角落 (那里弹最少), 于是出现
+        "活满 2000 步但从不输出"的退化。位置偏好给这种退化解一个明确的负梯度。
+
+        值域约 ``[-1.5, 0]``, 再乘 ``position_scale``。
+        """
+        scale = self._w("position_scale")
+        if scale == 0.0:
+            return 0.0
+        if state.player_x is None or state.player_y is None:
+            return 0.0
+        px = float(state.player_x)
+        py = float(state.player_y)
+        target = self._w("position_y_target", 0.85)
+        edge = self._w("position_edge", 28.0)
+
+        # 纵向: 离理想高度的差距 (归一化)
+        score = -abs(py / 448.0 - target)
+        # 横向: 与 Boss 同列 (没有 Boss 位置时退化成"离中线近")
+        boss = (state.raw or {}).get("boss_position")
+        if boss:
+            score -= abs(px - float(boss[0])) / 384.0
+        else:
+            score -= 0.5 * abs(px - 192.0) / 192.0
+        # 贴边惩罚: 角落是"弹最少"的逃逸点, 必须让它的收益变成负的
+        if px < edge:
+            score -= (edge - px) / edge
+        elif px > 384.0 - edge:
+            score -= (px - (384.0 - edge)) / edge
+        return scale * score
 
     # ------------------------------------------------------------------
     def _danger(self, state: GameState) -> float:

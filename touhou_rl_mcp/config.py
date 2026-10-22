@@ -107,6 +107,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 缺口余量的势函数塑形 (φ' − φ, 不改变最优策略); 0 = 关闭。
         # 它是 WEIGHT_DOCS 里的一项, 必须在这里也有默认值, 否则 patch 校验会拒绝它。
         "gap_margin_scale": 0.0,
+        "progress_scale": 0.0,        # 多目标: Δ(Boss 血量比) 的奖励
+        "position_scale": 0.0,        # 多目标: 位置偏好 (离理想站位越远扣得越多)
+        "position_y_target": 0.85,    # 位置偏好的理想 y (归一化)
+        "position_edge": 28.0,        # 贴边判定阈值 (px)
         "alive_bonus": 0.3,  # 每 step 存活奖励
         "time_penalty": -0.01,  # 每 step 的固定惩罚, 鼓励速通
         "clip": 8000.0,  # 单步奖励裁剪 (None 表示不裁剪)

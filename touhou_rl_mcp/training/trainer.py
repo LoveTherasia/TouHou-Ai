@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 from ..config import runtime_dir
-from ..types import GameState
+from ..types import PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, GameState
 from .features import encode_observation, feature_dim, gap_spec_from, observation_dim
 from .gap_label import update_action_age
 from .journal import Journal
@@ -34,6 +34,9 @@ from .policy import MLPPolicy
 #: 判定"自机在 Boss 火力线上"的横向容差 (像素)。
 #: mock 的伤害窗口是 22px, 真机正作的散射更宽; 这里只作为**诊断指标**,
 #: 不参与奖励计算, 所以取一个略宽的 24px。
+#: 诊断用: 自机 y 小于它就记为"贴顶" (与 mpc_top_margin 默认值一致)
+TOP_ZONE_DIAG = 42.0
+
 ALIGN_TOLERANCE = 24.0
 
 #: 9 个方向 (空字符串 = 原地不动)
@@ -142,6 +145,10 @@ class TrainConfig:
     expand_input: bool = False
     #: 观测改用"未来占用栅格 + 几何缺口" (见 training/occupancy.py)。
     #: 这是密集弹幕下唯一能让策略提前横向占位的表示; 需要弹速 (mock 直接提供)。
+    #: Deep Sets 观测: 不定长弹列表 -> 逐弹 φ 投影 + mean/max 池化 (置换不变)
+    use_set: bool = False
+    #: φ 的嵌入维度 (固定随机投影)
+    set_embed: int = 32
     use_gap: bool = False
     #: use_gap 时拼接哪几块 (时间分层栅格 / TTA 剖面 / 8 方向安全余量)
     gap_grid: bool = True
@@ -236,6 +243,77 @@ class TrainConfig:
     #: 规划器的对准偏好: 在所有同样安全的位置里挑离 Boss 那列最近的。
     #: 实测 0.15 把对准率从 0~20% 提到 61~92%, 存活一步不掉 (见 VIABILITY_PLANNER.md)
     planner_aim_weight: float = 0.15
+    # ---- MPC 老师 (docs/PLANNER_V2.md §8) ----
+    #: MPC 视界(帧)。24 = 反应式; 72+ 才能开始为墙让位 (但反应式弹型会退化)
+    mpc_horizon: int = 24
+    #: MPC 每个控制步推进的帧数 (= 承诺期)
+    mpc_dt: int = 3
+    #: CEM 采样数 / 迭代轮数
+    mpc_samples: int = 48
+    mpc_iters: int = 3
+    #: 「缺口锚点」权重: 把终点往最近一堵墙的缺口列拉 (墙/闭合环需要 >0)
+    mpc_gap: float = 0.0
+    #: 「正上方弹幕柱」权重 (隐式缺口项, 早期做法, 与 mpc_gap 二选一)
+    mpc_column: float = 0.0
+    #: 按 WallDetector 切长/短视界 (短视界 24 + 长视界 72)
+    mpc_adaptive: bool = False
+    #: 规划一次执行几步 (1 = 每步重规划; 2~3 更稳也更快)
+    mpc_plan_every: int = 1
+    #: 「并列动作承诺」: 选定方向后 N 帧内不换向（除非新方向明显更便宜）。
+    #: 这是把老师标签噪声从源头掐掉的主开关 —— 实测承诺前相邻帧换向率 50~77%。
+    mpc_commit: int = 0
+    #: 承诺期内允许换向所需的代价优势 (px/代价单位)
+    mpc_switch: float = 0.0
+    #: focus 动作的代价优势阈值: 慢速要比全速便宜这么多才按 shift
+    mpc_focus_margin: float = 0.0
+    #: 老师确定化: 每帧用 `seed + frame` 重播种 CEM 噪声 (同一状态同一答案)
+    mpc_deterministic: bool = True
+    #: 「平滑安全余量」权重: 让代价随"离弹多远"连续变化, 而不是过了 margin 一律 0。
+    #: 代价向量要拿去回归 (cost-to-go) 时必须 >0, 否则 70% 的帧都是并列最优。
+    mpc_smooth: float = 0.0
+    mpc_smooth_sigma: float = 20.0
+    #: 承诺期（**游戏帧**，内部按 step_frames 折算成决策步）。实测 8~15 帧是舒服区间：
+    #: 太短等于没承诺，太长会在弹幕变向时锁死错误方向。
+    mpc_commit_frames: int = 0
+    #: 「持续贴边」惩罚：允许上穿躲弹，但待在天花板/墙角要付租金。
+    #: 只罚终点站位拦不住"贴顶"——规划器会先上去躲一堵墙、然后一直贴着。
+    mpc_top_w: float = 0.0
+    mpc_top_margin: float = 42.0
+    mpc_bottom_w: float = 0.0
+    mpc_bottom_margin: float = 30.0
+    mpc_edge_w: float = 0.0
+    mpc_edge_margin: float = 26.0
+    #: 用**软标签**蒸馏 (老师在每个动作上的代价 -> 目标分布), 而不是 argmax
+    soft_labels: bool = False
+    #: 软标签的温度: 代价差多少算"同样好"。代价量级 ~10~200, 默认 20
+    soft_temp: float = 20.0
+    #: 用 **cost-to-go 回归**蒸馏: 学生输出层直接回归 `-相对代价/T`（等价于把
+    #: MPC 的价值函数蒸出来），再由学生自己 argmax。与 soft_labels 二选一或并用。
+    cost_to_go: bool = False
+    #: cost-to-go 回归时对相对代价的上限截断（除以 soft_temp 后等于 logits 下限）
+    cost_clip: float = 8.0
+    #: 用**并列感知的成对排序损失**蒸馏 cost-to-go（`MLPPolicy.fit_rank`）。
+    #: 为什么不用回归：老师代价向量 74~78% 的帧最优与次优完全并列、其余全部撞截断，
+    #: 回归目标实际只有 {0, −clip} 两个值，学不出排序（§10.6）。
+    rank_ties: bool = False
+    #: 用 **tie-aware ListMLE** 蒸馏（与 ``rank_ties`` 二选一，优先级更高）。
+    #: 相比"并列组 CE"多用了组外的完整次序，样本效率更高；候选动作采样见下。
+    listmle: bool = False
+    #: ListMLE 每个状态只随机取 K 个候选动作（必含 argmin）；0 = 用全部动作。
+    #: 采样越少算得越快、负例越多样，但 K 太小会漏掉"几乎一样好"的动作。
+    rank_candidates: int = 0
+    #: 学生侧的**位置正则**：贴顶/贴底/贴边时，给"继续往外走"的动作加惩罚。
+    #: 老师那边已有位置偏好，这一项是兜底（学生只看到 32 颗弹，未必推得出"上面没路"）。
+    position_reg: bool = False
+    position_reg_weight: float = 2.0
+    #: 进入"贴边区"的深度阈值（px）：距顶/底/边小于它就算贴边
+    position_reg_zone: float = 70.0
+    #: 「回中场」吸引力（相对"别再往外"的倍数）。0 = 只罚不奖（实测贴顶 21%/78%）,
+    #: 0.8 = 同时奖励往回走，才是"允许上穿但不常驻天花板"的正确语义。
+    position_reg_pull: float = 0.8
+    #: 排序损失里"多大的代价差才算真的有差别"（代价单位；差更小的对视为并列，不产生梯度）
+    rank_margin: float = 20.0
+
     # ---- 分层切换 (策略 <-> 规划器) ----
     #: 评测/演示时开分层切换: 检测到"整幅横墙 / 多向收网"就改问规划器
     hier_switch: bool = False
@@ -311,6 +389,12 @@ class EpisodeRecord:
     boss_steps: int = 0
     #: 分层切换: 有多少步交给了规划器, 以及最后一次触发的原因 (curtain/encircle)
     planner_steps: int = 0
+    #: 「贴顶」诊断: 上穿本身是合法手段, 但**一直贴在天花板上**是退化行为
+    #: (min_y 常驻 8~20px、几乎不回中场)。这里记每局的贴顶步数与 y 的分布。
+    top_steps: int = 0
+    y_steps: int = 0
+    min_y: float | None = None
+    y_sum: float = 0.0
     switch_reason: str = ""
 
     @property
@@ -326,6 +410,15 @@ class EpisodeRecord:
         if not self.boss_steps:
             return None
         return round(self.aligned_steps / self.boss_steps, 3)
+
+    @property
+    def top_ratio(self) -> float:
+        """贴顶步数占比 (y < ``TOP_ZONE_DIAG``)。越低越好。"""
+        return round(self.top_steps / self.y_steps, 3) if self.y_steps else 0.0
+
+    @property
+    def mean_y(self) -> float:
+        return round(self.y_sum / self.y_steps, 1) if self.y_steps else 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,6 +465,16 @@ class Trajectory:
     bootstrap_value: float = 0.0
     #: 每个决策的样本权重 (危险状态加权; 空 = 等权)
     weights: list[float] = field(default_factory=list)
+    #: 软标签 (``(n_actions,)`` 目标分布; None = 用硬标签)。
+    #: 规划器老师"多个动作同样安全"时 argmax 会随机跳 (实测自一致率 ~25%),
+    #: 用代价分布代替 argmax 才能让学生学到真正的东西。
+    soft: list[Any] = field(default_factory=list)
+    #: 老师的逐动作 cost-to-go (``(n_actions,)``; None = 该步没有代价标签)。
+    #: 这是 cost-to-go 蒸馏的监督信号: 学生回归它, 再自己 argmax。
+    cost: list[Any] = field(default_factory=list)
+    #: 逐动作**位置正则** (``(n_actions,)`` 非负权重)。贴顶时对"继续向上"给正值，
+    #: 蒸馏损失里加 ``w·Σ p_a·reg_a``，压住"越贴越贴"的退化。
+    posreg: list[Any] = field(default_factory=list)
 
 
 class Trainer:
@@ -706,7 +809,10 @@ class Trainer:
             obs = encode_observation(state, config, prev_action=-1, action_age=0)
 
         observations: list[np.ndarray] = []
-        actions: list[int] = []
+        actions: list[Any] = []
+        softs: list[Any] = []
+        posregs: list[Any] = []
+        costs: list[Any] = []
         logps: list[float] = []
         values: list[float] = []
         rewards: list[float] = []
@@ -776,6 +882,36 @@ class Trainer:
                     ),
                     replan_every=int(getattr(config, "hier_replan_every", 1)),
                 )
+            elif teacher in {"mpc", "mpc_dagger"}:
+                from .mpc_teacher import MPCTeacher
+
+                # 只在"规划器能做的事"上打标签: 上穿/占位/长程站位。
+                # 每步 1~15ms, 比 viability(25~40ms) 便宜, 几千步的 DAgger 可承受。
+                guard = MPCTeacher(
+                    horizon=int(getattr(config, "mpc_horizon", 24)),
+                    dt=int(getattr(config, "mpc_dt", 3)),
+                    n_samples=int(getattr(config, "mpc_samples", 48)),
+                    iters=int(getattr(config, "mpc_iters", 3)),
+                    gap_weight=float(getattr(config, "mpc_gap", 0.0)),
+                    column_weight=float(getattr(config, "mpc_column", 0.0)),
+                    adaptive=bool(getattr(config, "mpc_adaptive", False)),
+                    plan_every=int(getattr(config, "mpc_plan_every", 1)),
+                    step_frames=int(config.step_frames),
+                    use_focus=config.use_focus,
+                    commit_steps=int(getattr(config, "mpc_commit", 0)),
+                    switch_margin=float(getattr(config, "mpc_switch", 0.0)),
+                    focus_margin=float(getattr(config, "mpc_focus_margin", 0.0)),
+                    deterministic=bool(getattr(config, "mpc_deterministic", True)),
+                    smooth_clear=float(getattr(config, "mpc_smooth", 0.0)),
+                    smooth_sigma=float(getattr(config, "mpc_smooth_sigma", 20.0)),
+                    commit_frames=int(getattr(config, "mpc_commit_frames", 0)),
+                    top_weight=float(getattr(config, "mpc_top_w", 0.0)),
+                    top_margin=float(getattr(config, "mpc_top_margin", 42.0)),
+                    bottom_weight=float(getattr(config, "mpc_bottom_w", 0.0)),
+                    bottom_margin=float(getattr(config, "mpc_bottom_margin", 30.0)),
+                    edge_weight=float(getattr(config, "mpc_edge_w", 0.0)),
+                    edge_margin=float(getattr(config, "mpc_edge_margin", 26.0)),
+                )
             elif teacher in {"hybrid", "hybrid_dagger"}:
                 from .hybrid_teacher import HybridTeacher
 
@@ -795,7 +931,8 @@ class Trainer:
         # 纯模仿 (guard/rule/gap) 时 beta=1, 完全由老师接管。
         dagger_beta = (float(getattr(config, "dagger_beta", 0.2))
                        if teacher in {"dagger", "rule_dagger", "gap_dagger",
-                                      "score_dagger", "hybrid_dagger", "hier_dagger"} else 1.0)
+                                      "score_dagger", "hybrid_dagger", "hier_dagger",
+                                      "mpc_dagger"} else 1.0)
         # 记录"上一动作"的方向下标; 缺口观测要靠它表达宏动作的承诺方向
         prev_dir = -1
         #: 连续同向决策步数 (给观测里的 action_age 维; 推理时同样可从自己的动作算)
@@ -843,6 +980,28 @@ class Trainer:
             # label = 老师对该状态的动作(用于模仿); exec = 实际执行的动作
             label: int | None = None
             exec_action = action
+            soft_vec = None
+            if (guard is not None
+                    and bool(getattr(config, "soft_labels", False))
+                    and hasattr(guard, "soft_labels")):
+                try:
+                    soft_vec = guard.soft_labels(
+                        state, float(getattr(config, "soft_temp", 20.0)))
+                except Exception:
+                    soft_vec = None
+            cost_vec = None
+            if (guard is not None
+                    and (bool(getattr(config, "cost_to_go", False))
+                         or bool(getattr(config, "rank_ties", False))
+                         or bool(getattr(config, "listmle", False)))
+                    and hasattr(guard, "cost_vector")):
+                try:
+                    cost_vec = guard.cost_vector(state)
+                except Exception:
+                    cost_vec = None
+            pos_reg = (self._position_reg(state)
+                       if (guard is not None and bool(getattr(config, "position_reg", False)))
+                       else None)
             if guard is not None:
                 try:
                     teacher_action, _tinfo = guard.choose(state, state.frame, self.action_table[action])
@@ -881,6 +1040,9 @@ class Trainer:
                     actions.append(action)
                 else:
                     actions.append(-1)      # 无标签: 只参与 KL 锚
+                softs.append(soft_vec)
+                costs.append(cost_vec)
+                posregs.append(pos_reg)
                 logps.append(float(logp))
                 values.append(value)
                 rewards.append(float(step.reward))
@@ -906,6 +1068,16 @@ class Trainer:
                 try:
                     if abs(float(state.player_x) - float(boss_pos[0])) <= ALIGN_TOLERANCE:
                         record.aligned_steps += 1
+                except (TypeError, ValueError):
+                    pass
+            if state.player_y is not None:
+                try:
+                    py = float(state.player_y)
+                    record.y_steps += 1
+                    record.y_sum += py
+                    record.min_y = py if record.min_y is None else min(record.min_y, py)
+                    if py < TOP_ZONE_DIAG:
+                        record.top_steps += 1
                 except (TypeError, ValueError):
                     pass
             for key, value_part in (step.info.get("reward_parts") or {}).items():
@@ -1012,6 +1184,9 @@ class Trainer:
             dones=dones,
             bootstrap_value=bootstrap,
             weights=weights,
+            soft=softs,
+            cost=costs,
+            posreg=posregs,
         )
 
     def _state_weight(self, state: GameState) -> float:
@@ -1029,6 +1204,64 @@ class Trainer:
         except Exception:
             return 1.0
         return 1.0 + w * max(0.0, 1.0 - d / max(1e-6, radius))
+
+    def _action_dirs(self) -> np.ndarray:
+        """``(n_actions, 2)`` 每个动作的单位方向（从动作名解析，含 focus 块）。"""
+        cached = getattr(self, "_dir_cache", None)
+        if cached is not None and cached.shape[0] == len(self.action_table):
+            return cached
+        dirs = np.zeros((len(self.action_table), 2), dtype=np.float64)
+        for i, name in enumerate(self.action_table):
+            if "left" in name:
+                dirs[i, 0] = -1.0
+            elif "right" in name:
+                dirs[i, 0] = 1.0
+            if "up" in name:
+                dirs[i, 1] = -1.0
+            elif "down" in name:
+                dirs[i, 1] = 1.0
+        self._dir_cache = dirs
+        return dirs
+
+    def _position_reg(self, state: Any) -> np.ndarray | None:
+        """贴顶/贴底/贴边时，给"继续往外走"的动作一个非负权重。
+
+        为什么学生侧还要再加这一项：老师的代价里已经有位置偏好（``mpc_top_w``），
+        但学生**只看到最近 32 颗弹**——它未必能推出"上面已经没有路了"。这项正则
+        不依赖观测，只依赖自机位置，是纯几何的兜底，专门压住"上穿之后一直贴顶"。
+
+        权重按越界深度线性给（贴得越深罚得越重），到 ``zone`` 边界降为 0，
+        所以在边界附近不会突然"抖"一下。
+        """
+        if not bool(getattr(self.config, "position_reg", False)):
+            return None
+        px, py = getattr(state, "player_x", None), getattr(state, "player_y", None)
+        if px is None or py is None:
+            return None
+        zone = max(1.0, float(getattr(self.config, "position_reg_zone", 70.0)))
+        # 「回中场」的吸引力: 只罚"继续往外"是不够的 —— 实测贴顶 21%、ring_gate
+        # 更是 78%（学生学会上穿之后就一直挂在天花板上）。原因是"不往上"≠"往下"：
+        # 在顶部时"停住/横移"同样不产生惩罚，于是最省事的选择就是继续贴着。
+        # 这里给"往回走"**负权重**（乘 p_a 后等于奖励），形成"贴顶 -> 回中场"的闭环。
+        pull = float(getattr(self.config, "position_reg_pull", 0.8))
+        dirs = self._action_dirs()
+        reg = np.zeros(dirs.shape[0], dtype=np.float64)
+        # 顶部: 罚继续向上, 同时奖励往下
+        if py < zone:
+            depth = (zone - float(py)) / zone
+            reg += depth * (np.maximum(0.0, -dirs[:, 1]) - pull * np.maximum(0.0, dirs[:, 1]))
+        # 底部: 罚继续向下, 奖励往上
+        if py > PLAYFIELD_HEIGHT - zone:
+            depth = (float(py) - (PLAYFIELD_HEIGHT - zone)) / zone
+            reg += depth * (np.maximum(0.0, dirs[:, 1]) - pull * np.maximum(0.0, -dirs[:, 1]))
+        # 左右: 贴边时罚往外、奖励往内
+        if px < zone:
+            depth = (zone - float(px)) / zone
+            reg += depth * (np.maximum(0.0, -dirs[:, 0]) - pull * np.maximum(0.0, dirs[:, 0]))
+        elif px > PLAYFIELD_WIDTH - zone:
+            depth = ((float(px) - (PLAYFIELD_WIDTH - zone)) / zone)
+            reg += depth * (np.maximum(0.0, dirs[:, 0]) - pull * np.maximum(0.0, -dirs[:, 0]))
+        return reg if np.any(np.abs(reg) > 1e-9) else None
 
     def _teacher_index(self, action: str) -> int:
         """把老师动作字符串(如 'up_right+shoot+focus')映射到动作表索引(方向顺序一致)。"""
@@ -1055,8 +1288,9 @@ class Trainer:
         if (self.config.teacher or "").strip():
             # 模仿学习: 直接交叉熵拟合老师动作, 不用回报/优势
             obs_all: list[np.ndarray] = []
-            act_all: list[int] = []
+            act_all: list[Any] = []
             w_all: list[float] = []
+            has_soft = any(getattr(t, "soft", None) for t in batch)
             for traj in batch:
                 obs_all.extend(traj.observations)
                 act_all.extend(traj.actions)
@@ -1067,7 +1301,90 @@ class Trainer:
             if not obs_all:
                 return {}
             X = np.stack(obs_all)
-            A = np.asarray(act_all, dtype=np.int64)
+            has_cost = any(getattr(t, "cost", None) for t in batch)
+            if has_cost:
+                # cost-to-go 蒸馏: 目标是老师**逐动作的代价向量**, 不是他挑的那个动作。
+                # 并列动作天然免疫 (代价接近 -> 目标 logits 接近), 而硬标签会把
+                # "这帧老师随机翻了左边"当成真理教给学生。
+                n_act = len(self.action_table)
+                C = np.full((len(act_all), n_act), np.nan, dtype=np.float64)
+                PR = np.zeros((len(act_all), n_act), dtype=np.float64)
+                use_posreg = (bool(getattr(self.config, "position_reg", False))
+                              and float(getattr(self.config, "position_reg_weight", 0.0)) > 0.0)
+                pos = 0
+                for traj in batch:
+                    vecs = list(getattr(traj, "cost", []) or [])
+                    regs = list(getattr(traj, "posreg", []) or [])
+                    for i in range(len(traj.actions)):
+                        vec = vecs[i] if i < len(vecs) else None
+                        if vec is not None:
+                            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                            if arr.shape[0] == n_act:
+                                C[pos] = arr
+                        if use_posreg:
+                            r = regs[i] if i < len(regs) else None
+                            if r is not None:
+                                ra = np.asarray(r, dtype=np.float64).reshape(-1)
+                                if ra.shape[0] == n_act:
+                                    # 允许负权重: 负值 = 奖励"回到中场"
+                                    PR[pos] = ra
+                        pos += 1
+                if not bool(np.isfinite(C).any()):
+                    return {}
+                W = np.asarray(w_all, dtype=np.float64)
+                epochs = max(1, int(getattr(self.config, "teacher_epochs", 8)))
+                mb = max(64, int(getattr(self.config, "ppo_minibatch", 256)))
+                rng = np.random.default_rng(self.config.seed + len(self.episodes))
+                stats: dict[str, float] = {}
+                for _ in range(epochs):
+                    order = rng.permutation(len(X))
+                    for start in range(0, len(X), mb):
+                        idx = order[start:start + mb]
+                        with self.policy_lock:
+                            if bool(getattr(self.config, "listmle", False)):
+                                stats = self.policy.fit_listmle(
+                                    X[idx], C[idx], weights=W[idx],
+                                    margin=float(getattr(self.config, "rank_margin", 20.0)),
+                                    candidates=int(getattr(self.config, "rank_candidates", 0)),
+                                    # 种子随更新次数走: 每轮换一批负例, 否则采到的
+                                    # 那几个动作会被系统性强化
+                                    seed=int(self.config.seed) + self.policy._t,
+                                    posreg=PR[idx] if use_posreg else None,
+                                    posreg_weight=float(
+                                        getattr(self.config, "position_reg_weight", 0.0)),
+                                )
+                            elif bool(getattr(self.config, "rank_ties", False)):
+                                # 并列感知排序: 只从"代价差 > rank_margin"的动作对里学
+                                stats = self.policy.fit_rank(
+                                    X[idx], C[idx], weights=W[idx],
+                                    margin=float(getattr(self.config, "rank_margin", 20.0)),
+                                )
+                            else:
+                                stats = self.policy.fit_cost(
+                                    X[idx], C[idx], weights=W[idx],
+                                    temp=float(getattr(self.config, "soft_temp", 20.0)),
+                                    clip=float(getattr(self.config, "cost_clip", 8.0)),
+                                )
+                return stats
+            if has_soft:
+                # 每行变成目标分布: 软标签优先, 硬标签转 one-hot, -1 行全 0 (只进 KL 锚)
+                n_act = len(self.action_table)
+                P = np.zeros((len(act_all), n_act), dtype=np.float64)
+                pos = 0
+                for traj in batch:
+                    vecs = list(getattr(traj, "soft", []) or [])
+                    for i, a_lab in enumerate(traj.actions):
+                        vec = vecs[i] if i < len(vecs) else None
+                        if vec is not None:
+                            v = np.asarray(vec, dtype=np.float64).reshape(-1)
+                            if v.shape[0] == n_act:
+                                P[pos] = np.maximum(v, 0.0)
+                        elif a_lab is not None and a_lab >= 0:
+                            P[pos, int(a_lab)] = 1.0
+                        pos += 1
+                A = P
+            else:
+                A = np.asarray(act_all, dtype=np.int64)
             W = np.asarray(w_all, dtype=np.float64)
             epochs = max(1, int(getattr(self.config, "teacher_epochs", 8)))
             mb = max(64, int(getattr(self.config, "ppo_minibatch", 256)))

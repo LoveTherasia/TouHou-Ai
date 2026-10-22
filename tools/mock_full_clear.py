@@ -61,7 +61,7 @@ def main() -> int:
     ap.add_argument("--teacher", default="",
                     choices=["", "guard", "dagger", "rule", "rule_dagger", "gap", "gap_dagger",
                              "score", "score_dagger", "hybrid", "hybrid_dagger",
-                             "viability", "hier", "hier_dagger"],
+                             "viability", "hier", "hier_dagger", "mpc", "mpc_dagger"],
                     help="模仿学习: rule=规则老师(与 dodge 宏同源)接管并克隆; rule_dagger=策略驱动+老师打标签; "
                          "score/score_dagger=按奖励权重(score_scale)在安全方向里排序打标签; "
                          "hybrid/hybrid_dagger=力场先验 + 分数重排; "
@@ -81,6 +81,74 @@ def main() -> int:
                     help="hybrid 老师: 软安全屏障权重 (clearance 归零时的惩罚)")
     ap.add_argument("--hybrid-align-horizon", type=float, default=22.0,
                     help="hybrid 老师: 对准收益的估计窗口(帧); 拉长会牺牲存活")
+    ap.add_argument("--mpc-horizon", type=int, default=24,
+                    help="MPC 老师视界(帧): 24=反应式; 72+ 才会为墙让位")
+    ap.add_argument("--mpc-dt", type=int, default=3, help="MPC 老师的控制步长(帧)")
+    ap.add_argument("--mpc-samples", type=int, default=48, help="MPC 的 CEM 采样数")
+    ap.add_argument("--mpc-iters", type=int, default=3, help="MPC 的 CEM 迭代轮数")
+    ap.add_argument("--mpc-gap", type=float, default=0.0,
+                    help="缺口锚点权重 (墙/闭合环需要 >0)")
+    ap.add_argument("--mpc-column", type=float, default=0.0,
+                    help="正上方弹幕柱权重 (与 --mpc-gap 二选一)")
+    ap.add_argument("--mpc-adaptive", action="store_true",
+                    help="按墙体检测切换长短视界")
+    ap.add_argument("--soft-labels", action="store_true",
+                    help="用老师的逐动作代价做**软标签**蒸馏 (代替 argmax; "
+                         "MPC 的 argmax 自一致率只有 ~25%%)")
+    ap.add_argument("--soft-temp", type=float, default=20.0,
+                    help="软标签温度: 代价差多少算'同样好'")
+    ap.add_argument("--mpc-plan-every", type=int, default=1,
+                    help="MPC 规划一次执行几步 (2~3 更稳也更快)")
+    ap.add_argument("--mpc-commit", type=int, default=0,
+                    help="MPC 老师「并列动作承诺」: 选定方向后 N 帧不换向 "
+                         "(把标签噪声从源头掐掉; 建议 2~4)")
+    ap.add_argument("--mpc-switch", type=float, default=0.0,
+                    help="承诺期内换向所需的代价优势 (px/代价单位)")
+    ap.add_argument("--mpc-focus-margin", type=float, default=0.0,
+                    help="MPC 老师: 慢速(focus)要比全速便宜这么多才按 shift")
+    ap.add_argument("--no-mpc-deterministic", dest="mpc_deterministic",
+                    action="store_false",
+                    help="关闭「每帧用 seed+frame 重播种 CEM 噪声」的确定化")
+    ap.add_argument("--mpc-smooth", type=float, default=0.0,
+                    help="MPC 的「平滑安全余量」权重 (cost-to-go 蒸馏建议 10; "
+                         "让代价随离弹距离连续变化, 打破'并列最优')")
+    ap.add_argument("--mpc-smooth-sigma", type=float, default=20.0,
+                    help="平滑余量的衰减尺度 (px)")
+    ap.add_argument("--rank-ties", action="store_true",
+                    help="用**并列感知的成对排序损失**蒸馏 cost-to-go (代价差 < margin 的动作对"
+                         "视为并列、不产生梯度); 比 --cost-to-go 回归更抗并列")
+    ap.add_argument("--rank-margin", type=float, default=20.0,
+                    help="排序损失: 多大的代价差才算真的有差别 (代价单位)")
+    ap.add_argument("--listmle", action="store_true",
+                    help="用 **tie-aware ListMLE** 蒸馏 (按并列组连乘的 listwise 排序, "
+                         "比 --rank-ties 多用了组外的完整次序; 建议配 --lr 3e-4~1e-3)")
+    ap.add_argument("--rank-candidates", type=int, default=0,
+                    help="ListMLE 每个状态只随机取 K 个候选动作 (必含 argmin); 0=全部")
+    ap.add_argument("--position-reg", action="store_true",
+                    help="蒸馏时加**位置正则**: 贴顶/贴底/贴边时压住'继续往外走'的动作 "
+                         "(防止上穿之后一直贴顶)")
+    ap.add_argument("--position-reg-weight", type=float, default=2.0,
+                    help="位置正则的权重")
+    ap.add_argument("--position-reg-zone", type=float, default=70.0,
+                    help="进入'贴边区'的深度阈值 (px)")
+    ap.add_argument("--position-reg-pull", type=float, default=0.8,
+                    help="'回中场'吸引力: 0=只罚继续往外(实测贴顶 21%%, ring_gate 78%%); "
+                         "0.8=同时奖励往回走, 才是'允许上穿但不常驻天花板'")
+    ap.add_argument("--mpc-commit-frames", type=int, default=0,
+                    help="MPC 承诺期 (游戏帧, 8~15); 0=不用。承诺期结束后重新规划")
+    ap.add_argument("--mpc-top-w", type=float, default=0.0,
+                    help="MPC 的「持续贴顶」惩罚权重 (>0 才生效; 建议 1~3)")
+    ap.add_argument("--mpc-top-margin", type=float, default=42.0,
+                    help="顶部安全区厚度 (px), 自机 y 小于它算贴顶")
+    ap.add_argument("--mpc-bottom-w", type=float, default=0.0,
+                    help="MPC 的「持续贴底」惩罚权重")
+    ap.add_argument("--mpc-edge-w", type=float, default=0.0,
+                    help="MPC 的「持续贴左右边」惩罚权重")
+    ap.add_argument("--cost-to-go", action="store_true",
+                    help="用 **cost-to-go 回归**蒸馏 (学生输出层回归 -相对代价/T, "
+                         "自己 argmax); 与 --soft-labels 相比梯度不饱和")
+    ap.add_argument("--cost-clip", type=float, default=8.0,
+                    help="cost-to-go 回归时相对代价的截断上限 (除以温度后=logits 下限)")
     ap.add_argument("--planner-horizon", type=int, default=180,
                     help="viability 老师: 规划视野(帧)")
     ap.add_argument("--hier-replan-every", type=int, default=1,
@@ -197,6 +265,24 @@ def main() -> int:
             hybrid_barrier_weight=args.hybrid_barrier_weight,
             hybrid_align_horizon=args.hybrid_align_horizon,
             hybrid_wall_horizon=args.hybrid_wall_horizon,
+            mpc_horizon=args.mpc_horizon, mpc_dt=args.mpc_dt,
+            mpc_samples=args.mpc_samples, mpc_iters=args.mpc_iters,
+            mpc_gap=args.mpc_gap, mpc_column=args.mpc_column,
+            mpc_adaptive=args.mpc_adaptive, mpc_plan_every=args.mpc_plan_every,
+            mpc_commit=args.mpc_commit, mpc_switch=args.mpc_switch,
+            mpc_focus_margin=args.mpc_focus_margin,
+            mpc_smooth=args.mpc_smooth, mpc_smooth_sigma=args.mpc_smooth_sigma,
+            mpc_deterministic=args.mpc_deterministic,
+            soft_labels=args.soft_labels, soft_temp=args.soft_temp,
+            cost_to_go=args.cost_to_go, cost_clip=args.cost_clip,
+            rank_ties=args.rank_ties, rank_margin=args.rank_margin,
+            listmle=args.listmle, rank_candidates=args.rank_candidates,
+            position_reg=args.position_reg, position_reg_weight=args.position_reg_weight,
+            position_reg_zone=args.position_reg_zone,
+            position_reg_pull=args.position_reg_pull,
+            mpc_commit_frames=args.mpc_commit_frames,
+            mpc_top_w=args.mpc_top_w, mpc_top_margin=args.mpc_top_margin,
+            mpc_bottom_w=args.mpc_bottom_w, mpc_edge_w=args.mpc_edge_w,
             planner_horizon=args.planner_horizon,
             planner_dt=args.planner_dt,
             hier_replan_every=args.hier_replan_every,
@@ -296,11 +382,26 @@ def main() -> int:
             last_log = n
             recent = trainer.episodes[-50:]
             m = max(1, len(recent))
+            extra = ""
+            stats = getattr(trainer, "_last_update", None) or {}
+            if "listmle_loss" in stats:
+                extra = (f" ListMLE[acc={stats.get('rank_acc', 0):.0%} "
+                         f"组数={stats.get('groups', 0):.1f} "
+                         f"loss={stats.get('listmle_loss', 0):.3f}]")
+            elif "rank_acc" in stats:
+                extra = (f" 排序[acc={stats.get('rank_acc', 0):.0%} "
+                         f"good={stats.get('good_mean', 0)} "
+                         f"loss={stats.get('rank_loss', 0):.3f}]")
+            elif "agree" in stats:
+                extra = (f" 蒸馏[cost_mae={stats.get('cost_mae', 0):.3f} "
+                         f"argmin一致={stats.get('agree', 0):.0%}]")
+            elif "imitation_loss" in stats:
+                extra = f" 模仿[loss={stats.get('imitation_loss', 0):.3f}]"
             log(f"[full] ep={n:5d} 回报(近50均)={sum(e.return_ for e in recent)/m:8.1f} "
                 f"存活步数(近50均)={sum(e.steps for e in recent)/m:7.0f} "
                 f"掉残(均)={sum(e.misses for e in recent)/m:.1f} "
                 f"伤害(均)={sum(e.boss_damage for e in recent)/m:6.0f} "
-                f"对准率={sum((e.align_ratio or 0.0) for e in recent)/m:.0%}")
+                f"对准率={sum((e.align_ratio or 0.0) for e in recent)/m:.0%}" + extra)
 
     trainer.stop(save=True)
     save_png(trainer.progress_image(), out, name="progress.png")

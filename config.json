@@ -36,7 +36,11 @@
     "alive_bonus": 0.3,
     "time_penalty": -0.01,
     "clip": 8000.0,
-    "shaping_scale": 1.0
+    "shaping_scale": 1.0,
+    "progress_scale": 0.0,
+    "position_scale": 0.0,
+    "position_y_target": 0.85,
+    "position_edge": 28.0
   },
   "control": {
     "tick_hz": 60,

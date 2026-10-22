@@ -51,6 +51,103 @@ WALL_LOOKAHEAD = 180.0
 WALL_ROW_BAND = 26.0
 
 
+#: Deep Sets 观测: 每颗弹的原始特征 (dx, dy, vx, vy, ttc) 归一化后的维度
+SET_RAW_DIM = 5
+#: 每颗弹经 φ 投影后的嵌入维度 (φ 是固定随机投影, 详见 :func:`encode_set_block`)
+SET_EMBED_DIM = 32
+#: φ 的随机种子 (固定, 保证训练/推理/不同工具得到同一套投影)
+SET_PROJECTION_SEED = 20261022
+#: 池化后额外给出的标量: 弹数 / 最近距离
+SET_EXTRA_DIM = 2
+
+
+def set_feature_dim(embed: int = SET_EMBED_DIM) -> int:
+    """Deep Sets 池化块维度 = mean 池化 + max 池化 + 2 个标量。"""
+    return 2 * int(embed) + SET_EXTRA_DIM
+
+
+_SET_PROJ_CACHE: dict[int, np.ndarray] = {}
+
+
+def set_projection(embed: int = SET_EMBED_DIM) -> np.ndarray:
+    """固定随机投影矩阵 ``(SET_RAW_DIM, embed)``; 同 embed 永远返回同一份。"""
+    embed = int(embed)
+    proj = _SET_PROJ_CACHE.get(embed)
+    if proj is None:
+        rng = np.random.default_rng(SET_PROJECTION_SEED)
+        proj = rng.standard_normal((SET_RAW_DIM, embed)) / math.sqrt(SET_RAW_DIM)
+        _SET_PROJ_CACHE[embed] = proj
+    return proj
+
+
+def bullet_set_features(state: GameState, px: float | None = None,
+                        py: float | None = None) -> np.ndarray:
+    """把弹幕列表变成 ``(N, SET_RAW_DIM)`` 的归一化行向量。
+
+    顺序与 ``state.bullets`` 一致 —— 但下游只做 mean/max 池化, 所以**顺序无所谓**,
+    这正是 Deep Sets 要的置换不变性。
+    """
+    bullets = state.bullets or []
+    if not bullets:
+        return np.zeros((0, SET_RAW_DIM), dtype=np.float64)
+    cx = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+    cy = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+    if px is not None:
+        cx = float(px)
+    if py is not None:
+        cy = float(py)
+
+    arr = np.asarray(bullets, dtype=np.float64).reshape(-1, 2)
+    dx = arr[:, 0] - cx
+    dy = arr[:, 1] - cy
+    dist = np.hypot(dx, dy)
+
+    vel = (state.raw or {}).get("bullet_velocity") or []
+    try:
+        v = np.asarray(vel, dtype=np.float64).reshape(-1, 2)
+        if v.shape[0] != arr.shape[0]:
+            raise ValueError("velocity/bullet count mismatch")
+    except Exception:
+        v = np.zeros((arr.shape[0], 2), dtype=np.float64)
+
+    # ttc: 最近接近时间 (弹幕与自机的相对速度在径向的投影)
+    rel = np.stack([dx, dy], axis=1)
+    rv = -v                                    # 自机静止时的相对速度
+    rv2 = np.maximum(1e-6, (rv * rv).sum(axis=1))
+    t = np.clip((rel * rv).sum(axis=1) / rv2, 0.0, 300.0)
+
+    out = np.empty((arr.shape[0], SET_RAW_DIM), dtype=np.float64)
+    out[:, 0] = dx / PLAYFIELD_WIDTH
+    out[:, 1] = dy / PLAYFIELD_HEIGHT
+    out[:, 2] = v[:, 0] / VELOCITY_SCALE
+    out[:, 3] = v[:, 1] / VELOCITY_SCALE
+    out[:, 4] = t / 300.0
+    return out
+
+
+def encode_set_block(state: GameState, px: float | None = None,
+                     py: float | None = None,
+                     embed: int = SET_EMBED_DIM) -> np.ndarray:
+    """Deep Sets 观测块: 逐弹 φ 投影 → mean/max 池化。
+
+    ``φ`` 是**固定**随机投影 (不是学出来的), 因此这一步与策略参数无关:
+    换一批弹、打乱顺序、数量变化, 输出维度都不变。要"端到端学 φ"需要把策略改成
+    set-encoder 结构 (见 ``docs/PLANNER_V2.md`` §5.4)。
+    """
+    feats = bullet_set_features(state, px, py)
+    dim = set_feature_dim(embed)
+    vec = np.zeros(dim, dtype=np.float64)
+    if feats.shape[0] == 0:
+        return vec
+    phi = feats @ set_projection(embed)          # (N, embed)
+    vec[:embed] = phi.mean(axis=0)
+    vec[embed:2 * embed] = phi.max(axis=0)
+    dist = np.hypot(feats[:, 0] * PLAYFIELD_WIDTH, feats[:, 1] * PLAYFIELD_HEIGHT)
+    vec[2 * embed] = min(1.0, feats.shape[0] / 200.0)      # 弹数
+    vec[2 * embed + 1] = min(1.0, float(dist.min()) / 320.0)  # 最近弹距离
+    return vec
+
+
 def bullet_feature_dim(use_velocity: bool = False) -> int:
     return BULLET_FEATURE_DIM + (BULLET_VELOCITY_DIM if use_velocity else 0)
 
@@ -598,8 +695,12 @@ def gap_encoder(config: Any) -> GapObservation:
 
 
 def observation_dim(config: Any) -> int:
-    """按 :class:`TrainConfig` 算出观测维度 (缺口 / 危险图 / 最近K弹三选一)。"""
+    """按 :class:`TrainConfig` 算出观测维度 (DeepSets / 缺口 / 危险图 / 最近K弹)。"""
     wall = WALL_FEATURE_DIM if getattr(config, "use_wall_feat", False) else 0
+    if getattr(config, "use_set", False):
+        return (global_feature_dim(config.use_invincible, config.use_boss,
+                                   config.use_danger_grad)
+                + set_feature_dim(int(getattr(config, "set_embed", SET_EMBED_DIM))) + wall)
     if getattr(config, "use_gap", False):
         return gap_observation_dim(gap_spec_from(config)) + wall
     if getattr(config, "use_grid", False):
@@ -636,7 +737,8 @@ class ObservationEncoder:
                  use_gap: bool = False, gap_grid: bool = True, gap_geo: bool = True,
                  gap_clearance: bool = True, gap_prev_action: bool = True,
                  gap_action_age: bool = False, gap_action_age_cap: int = 12,
-                 gap_layers: int = 1) -> None:
+                 gap_layers: int = 1,
+                 use_set: bool = False, set_embed: int = SET_EMBED_DIM) -> None:
         self.use_grid = bool(use_grid)
         self.grid_size = int(grid_size)
         self.grid_span = float(grid_span)
@@ -656,6 +758,8 @@ class ObservationEncoder:
         self.gap_action_age = bool(gap_action_age)
         self.gap_action_age_cap = int(gap_action_age_cap)
         self.gap_layers = int(gap_layers)
+        self.use_set = bool(use_set)
+        self.set_embed = int(set_embed)
 
     @classmethod
     def from_meta(cls, meta: dict | None = None) -> "ObservationEncoder":
@@ -680,6 +784,8 @@ class ObservationEncoder:
             gap_action_age=bool(meta.get("gap_action_age", False)),
             gap_action_age_cap=int(meta.get("gap_action_age_cap", 12) or 12),
             gap_layers=int(meta.get("gap_layers", 1) or 1),
+            use_set=bool(meta.get("use_set", False)),
+            set_embed=int(meta.get("set_embed", SET_EMBED_DIM) or SET_EMBED_DIM),
         )
 
     @property
@@ -701,6 +807,9 @@ class ObservationEncoder:
                                   action_age=action_age)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
+        if self.use_set:
+            return (f"ObservationEncoder(deepset embed={self.set_embed} "
+                    f"walls={self.use_wall_feat} dim={self.dim})")
         if self.use_gap:
             spec = self.gap_spec
             return (f"ObservationEncoder(gap grid={spec.use_grid} geo={spec.use_geo} "
@@ -725,6 +834,21 @@ def encode_observation(state: GameState, config: Any,
     ``action_age`` 是"连续同向决策了多少步", 同样只对 ``use_gap`` 有效。
     """
     wall = bool(getattr(config, "use_wall_feat", False))
+    if getattr(config, "use_set", False):
+        px = float(state.player_x) if state.player_x is not None else PLAYFIELD_WIDTH / 2
+        py = float(state.player_y) if state.player_y is not None else PLAYFIELD_HEIGHT - 32
+        gdim = global_feature_dim(config.use_invincible, config.use_boss,
+                                  config.use_danger_grad)
+        block = encode_set_block(state, px, py,
+                                 int(getattr(config, "set_embed", SET_EMBED_DIM)))
+        dim = gdim + block.shape[0] + (WALL_FEATURE_DIM if wall else 0)
+        vec = np.empty(dim, dtype=np.float64) if out is None else out
+        _encode_globals(vec[:gdim], state, px, py, config.use_invincible,
+                        config.use_boss, config.use_danger_grad)
+        vec[gdim:gdim + block.shape[0]] = block
+        if wall:
+            vec[-WALL_FEATURE_DIM:] = wall_features(state, px, py)
+        return vec
     if getattr(config, "use_gap", False):
         base = gap_encoder(config)(state, prev_action=prev_action,
                                    action_age=action_age)
