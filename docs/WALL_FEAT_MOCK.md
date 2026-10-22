@@ -1,5 +1,7 @@
 # 155 维墙特征在 mock 上的训练验收（2026-10-21）
 
+> **状态：专题记录**。墙学会但遗忘通用弹型，结论见 [`CONCLUSIONS.md`](CONCLUSIONS.md) §2.2。
+
 > 状态：**实验完成，结论是"墙学得会，但同时会忘掉通用弹型"**。
 > 代码入口：`tools/mock_full_clear.py --wall-feat --expand-input ...`。
 

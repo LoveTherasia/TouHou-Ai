@@ -21,7 +21,9 @@
 
 ---
 
+> **结论速查（哪些被证实 / 哪些已作废 / 哪些没解决）**：[`docs/CONCLUSIONS.md`](docs/CONCLUSIONS.md)；
 > 项目现状、能力边界与路线图见 [`docs/STATUS.md`](docs/STATUS.md)；
+> 文档地图（哪篇现行、哪篇历史）见 [`docs/README.md`](docs/README.md)；
 > 历史会话记录在 [`docs/history/`](docs/history/)。
 
 ## 1. 快速开始
@@ -515,19 +517,19 @@ E:\TouHou-Ai\
 - `mock` 是**简化**的弹幕模拟，不是东方物理的复刻，用于跑通管线与调参，
   不能替代真机。
 
-**下一步（按价值排序，持续更新于 [`docs/STATUS.md`](docs/STATUS.md)）**
+**下一步（按价值排序；完整依据见 [`docs/CONCLUSIONS.md`](docs/CONCLUSIONS.md) §5）**
 
-1. ~~**奖励重平衡 + 诊断"苟活"**~~：已完成一半 —— `score_scale` / `danger_scale` 已按
-   "攻击 + 生存"重配平（[6.1](#61-攻击意识score_scale-为什么必须调大)），并新增
-   伤害/对准率诊断；`alive_bonus` 高于 `|time_penalty|` 的"苟活"空间仍在。
-2. **奖励加权 DAgger**：让老师在自己给出的安全候选里按分数排序再打标签 ——
-   目前 `score_scale` 只影响 PPO，而 PPO 会把 DAgger 打崩（[`docs/ATTACK_INTENT.md`](docs/ATTACK_INTENT.md)）。
-3. **PPO 稳定性**：每 batch 评估早停 + 余弦 lr + 更小 batch；或改用优势加权回归。
-4. **观测增强**：弹幕半径/类型、TTC（预计最近接近距离）、多帧堆叠。
-5. **真机鲁棒性**：进程/窗口/焦点看门狗，异常自动复位。
-6. **补齐 TH11** 的 `invincible`、激光；之后再考虑第二部作品。
-7. **replay → BC**：`tools/record_replay.py --bc-out` 采集，`tools/bc_from_replay.py` 训练
-   （设计见 [`docs/REPLAY_CLONING.md`](docs/REPLAY_CLONING.md)）。
+1. **奖励加「对准」项**：现在 `score` 只有真打中才给，而 `alive_bonus` 每步都给 →
+   DAgger 一放权就学成"横移躲弹、永不面向 Boss"（实测对准 0%、伤害 44）。
+   用 `|自机x − boss_x|` 直接给连续分，是修这个问题的根治办法。
+2. **突破老师上限**：纯模仿的上限就是老师（加难数据 15 424 帧）。要么把老师续训到
+   ≥3 万帧，要么分层让规划器接管密集段。
+3. **观测分辨率**：gap 32 车道对 9° 小扇形（同车道前后夹击）没有区分度，考虑 64 车道
+   或加"同车道最近两弹距离"。
+4. **真机鲁棒性**：进程/窗口/焦点看门狗，异常自动复位；补 `invincible`、激光。
+5. **道具（P 点）偏移**：需要反汇编"敌人死亡/掉道具"分支，已排除的范围见
+   [`docs/ITEMS.md`](docs/ITEMS.md)。
+6. **评估口径**：`pattern_bench` 报表固定加"贴角比例 + 上穿率"，避免高估能力。
 
 ---
 

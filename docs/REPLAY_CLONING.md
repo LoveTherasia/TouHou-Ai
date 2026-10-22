@@ -1,5 +1,8 @@
 # Replay → 行为克隆 / 离线 RL（设计文档）
 
+> **状态：设计稿（部分被取代）**。实际路线已改为「录制弹幕脚本 + mock 复刻」，
+> 见 [`REAL_GAP.md`](REAL_GAP.md)。结论见 [`CONCLUSIONS.md`](CONCLUSIONS.md)。
+
 目标：把东方正作的 **replay（`.rpy`）** 变成 `(真实状态, 人类动作)` 数据集，
 用来做行为克隆或离线 RL，缩小 mock→真机的 sim-to-real 差距。
 

@@ -1,5 +1,8 @@
 # 力场先验 + 分数重排: hybrid 老师
 
+> **状态：专题记录**。结论已并入 [`CONCLUSIONS.md`](CONCLUSIONS.md)；
+> 核心教训：老师强 ≠ 学生强。
+
 > 状态：**实现完成、可用，但没有打赢 rule-DAgger**。这份文档记录设计、实测数字，
 > 以及四个**已经量过的负面结果**——不要再重复踩。
 > 时间：2026-10-21。相关代码：`training/{hybrid_teacher,score_teacher,rule_teacher}.py`、

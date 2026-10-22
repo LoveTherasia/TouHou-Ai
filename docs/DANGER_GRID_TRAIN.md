@@ -1,5 +1,8 @@
 # 危险图 + 墙特征训练（2026-10-21）
 
+> **状态：专题记录（进行中）**。危险图+墙特征 48 局：墙 2000、普通弹型均值 1035，
+> 瓶颈是样本量。见 [`CONCLUSIONS.md`](CONCLUSIONS.md) §5。
+
 > 目标：**彻底不用 `k_bullets`/斥力**，用"危险图（2D 栅格）+ 12 维墙特征 + 规划器标签"
 > 训练一个能同时处理普通弹幕和墙的策略。
 > 代码：`mock_full_clear.py --grid ... --wall-feat`；验收：`pattern_bench.py --grid ... --wall-feat`。

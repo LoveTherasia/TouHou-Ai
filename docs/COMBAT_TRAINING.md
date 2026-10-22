@@ -65,3 +65,39 @@ TH11：character=0 灵梦、1 魔理沙；shot=0/1/2 对应 A/B/C。
 # 单独继续灵梦 C
 .\.venv\Scripts\python.exe examples\train.py --backend memory --restart-process --character 0 --shot 2 --load .runtime\loadout_training\20261017_225306\reimu_C\policy.npz --out .runtime\reimu_C_next
 ```
+
+## 真机 focus（按住 Shift 慢速）
+
+**为什么必须当真**：真机实测自机速度 4.5 px/帧、focus 后 2.0 px/帧（`CONCLUSIONS.md` §1）。
+判定半径只有 2 + 3 = 5px，全速一步 4.5px 相当于"每一步都在赌"，密弹里真人几乎全程
+按住 Shift。所以真机训练的动作表必须是 **18 个动作**（9 快 + 9 慢），并且**推理时
+同样用 18 个动作**——否则真机上模型只能全速跨步，看起来"笨"。
+
+落地要点（2026-10-22）：
+
+1. **输入链路**：`inputs/keyboard.py` 里 `"focus" → 0x10 (Shift)`；控制器按
+   `action_table` 里的 `focus` 后缀同时按下 Shift + 射击。真机上 Shift 与对话快进的
+   点按 Z 互不影响。
+2. **训练开关**：`TrainConfig.use_focus` 默认 **True**（`--no-focus` 只用于对照组）。
+   观测与动作维度会随之变化（9→18），旧模型不能用 `--load` 硬接，需 `expand`。
+3. **老师在真机物理上建模**：`MPCPlanner.focus_speed = speed × FOCUS_SPEED_RATIO`
+   （2/4.4 ≈ 0.45），并且 `step_frames=k` 时**跟着 × k** —— 之前 focus 速度写死 2.0，
+   k=2 时老师以为半步走 2px、实际走 4px，算出来的"半步位"全错。
+4. **训练前先自检**（关键）：Shift 有没有被游戏收到，只有真机能量出来。
+
+```powershell
+# 游戏需已进入关卡（不是标题/菜单）；比例落在 0.30~0.65 才算 PASS
+.\.venv\Scripts\python.exe tools\check_focus.py --frames 10 --rounds 3
+```
+
+失败表现与处置：
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| 慢速/全速 ≈ 1.0 | Shift 没被游戏收到 | 查窗口置前、游戏内 Slow 键映射、`focus_window` |
+| 慢速/全速 < 0.15 | Shift 一直是按下状态或绑错键 | 查 sticky key / 键盘映射 |
+| 比例偏离 0.45 较多 | 老师建模的半步位不准 | 调 `mpc.FOCUS_SPEED_RATIO`，别用默认值硬跑 |
+
+5. **评测也要带 focus**：`tools/pattern_bench.py` 默认 `focus=True`（`--no-focus` 关闭）；
+   用 9 动作模型去跑 18 动作配置会维度不匹配，反过来也一样。
+
