@@ -318,6 +318,8 @@ def main() -> int:
         damages = []
         aligns = []
         scores = []
+        tops = []
+        min_ys = []
         for k in range(count):
             rec, _ = eval_trainer._run_episode(k, greedy=True)
             rets.append(rec.return_)
@@ -325,12 +327,17 @@ def main() -> int:
             damages.append(rec.boss_damage)
             aligns.append(rec.align_ratio or 0.0)
             scores.append(rec.score_gain or 0)
+            # 行为诊断: 上穿是合法手段, 常驻天花板是退化 (见 PLANNER_V2 §13)
+            tops.append(getattr(rec, "top_ratio", 0.0) or 0.0)
+            if getattr(rec, "min_y", None) is not None:
+                min_ys.append(float(rec.min_y))
             best_stage = max(best_stage, rec.max_stage or 0)
             if rec.cleared:
                 clears += 1
         n = max(1, len(rets))
         return (clears, best_stage, sum(rets) / n, sum(steps) / n,
-                sum(damages) / n, sum(aligns) / n, sum(scores) / n)
+                sum(damages) / n, sum(aligns) / n, sum(scores) / n,
+                sum(tops) / n, min(min_ys) if min_ys else -1.0)
 
     log(f"[full] reward={json.dumps(reward, ensure_ascii=False)}")
     log(f"[full] algo={tc.algorithm} start_stage={tc.start_stage} focus={tc.use_focus} "
@@ -355,9 +362,10 @@ def main() -> int:
                 pass
         if n - last_eval >= args.eval_every and n > 0:
             last_eval = n
-            clears, stage, mean_ret, mean_steps, mean_dmg, mean_align, mean_score = greedy_eval(
-                args.eval_episodes)
-            attack = f"均伤害 {mean_dmg:6.0f} 对准率 {mean_align:.0%} 均净分 {mean_score:6.0f}"
+            (clears, stage, mean_ret, mean_steps, mean_dmg, mean_align, mean_score,
+             mean_top, min_y) = greedy_eval(args.eval_episodes)
+            attack = (f"均伤害 {mean_dmg:6.0f} 对准率 {mean_align:.0%} 均净分 {mean_score:6.0f}"
+                      f" 贴顶 {mean_top:.0%} min_y {min_y:5.0f}")
             if args.danmaku_script:
                 # 脚本模式 = 弹幕生存: 面数不可靠, 用"存活步数"当指标
                 key = (round(mean_steps, 1), round(mean_ret, 1))
@@ -397,11 +405,18 @@ def main() -> int:
                          f"argmin一致={stats.get('agree', 0):.0%}]")
             elif "imitation_loss" in stats:
                 extra = f" 模仿[loss={stats.get('imitation_loss', 0):.3f}]"
+            elif "policy_loss" in stats:
+                # PPO 诊断: kl 涨得太快 / clip_frac 接近 1 = 更新过猛, 策略会崩
+                extra = (f" PPO[kl={stats.get('kl', 0):.4f} "
+                         f"clip={stats.get('clip_frac', 0):.0%} "
+                         f"ent={stats.get('entropy', 0):.3f} "
+                         f"vloss={stats.get('value_loss', 0):.2f}]")
             log(f"[full] ep={n:5d} 回报(近50均)={sum(e.return_ for e in recent)/m:8.1f} "
                 f"存活步数(近50均)={sum(e.steps for e in recent)/m:7.0f} "
                 f"掉残(均)={sum(e.misses for e in recent)/m:.1f} "
                 f"伤害(均)={sum(e.boss_damage for e in recent)/m:6.0f} "
-                f"对准率={sum((e.align_ratio or 0.0) for e in recent)/m:.0%}" + extra)
+                f"对准率={sum((e.align_ratio or 0.0) for e in recent)/m:.0%} "
+                f"贴顶={sum((getattr(e, 'top_ratio', 0.0) or 0.0) for e in recent)/m:.0%}" + extra)
 
     trainer.stop(save=True)
     save_png(trainer.progress_image(), out, name="progress.png")

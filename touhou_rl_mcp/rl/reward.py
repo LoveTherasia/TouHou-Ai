@@ -144,6 +144,40 @@ REWARD_PROFILES: dict[str, dict[str, float]] = {
         "clip": 8000.0,
         "shaping_scale": 1.0,
     },
+    # 攻击优先的多目标: 专门修 PPO 微调里的"苟化"漂移。
+    #
+    # 实测（PLANNER_V2 §15）: 用 multi 档跑 PPO，存活 463 -> 902 步（+95%），
+    # 但训练日志里"伤害(均)"从 500 一路掉到 105、对准率 35% -> 7% ——
+    # 策略学会了"贴着中场横移苟活"。根因是**量级**: multi 里
+    #   progress_scale 6.0  × Δ血量比(0~1)  = 整条血最多 6 分
+    #   alive_bonus    0.3  × 600 步        ≈ 180 分
+    # 输出与存活是 1:30，PPO 当然选存活。这里把它们拉回同一量级：
+    #   progress 60 (整条血 ≈ 200 步存活)、boss_damage 0.3、alive 0.1。
+    # 注意 miss/death 惩罚一个字没动 —— 存活仍是硬约束，只是不再"躺着也赚"。
+    "multi_attack": {
+        "score_scale": 3e-2,
+        "progress_scale": 60.0,
+        "position_scale": 0.5,
+        "position_y_target": 0.85,
+        "position_edge": 28.0,
+        "boss_damage_scale": 0.3,
+        "danger_scale": 0.8,
+        "danger_radius": 32.0,
+        "alive_bonus": 0.1,
+        "time_penalty": -0.01,
+        "graze_scale": 0.02,
+        "miss_penalty": -200.0,
+        "death_penalty": -600.0,
+        "stage_clear_bonus": 1500.0,
+        "game_clear_bonus": 6000.0,
+        "spell_capture_bonus": 20.0,
+        "spell_clear_bonus": 150.0,
+        "life_bonus": 5.0,
+        "power_scale": 0.1,
+        "invincible_output_scale": 0.0,
+        "clip": 8000.0,
+        "shaping_scale": 1.0,
+    },
 }
 
 
