@@ -311,7 +311,7 @@ python tools\eval_policy.py --policy .runtime\...\policy_best --reward-profile a
 2. 确认游戏安装目录。`config.json` 的 `search_roots` 默认为 `F:\ E:\ D:\`，
    `th_list_games` 会自动在这些盘的下一级目录里找 `thXXc.exe`。
    也可以显式指定：`th_attach({"backend": "memory", "game": "th11", "game_dir": "F:\\[th11] 东方地灵殿 (汉化版+日文版)"})`。
-3. 若进程没在跑，`th_attach(backend="memory")` 会替你启动它。
+3. 若进程没在跑，`th_attach(backend="memory")` 会自动启动它。
 
 ### 7.2 偏移量现状
 
@@ -504,7 +504,7 @@ E:\TouHou-Ai\
 
 **限制**
 
-- **实时性**：真实游戏是 60fps 实时运行，Agent 决策慢于 60Hz 时游戏不会等你。
+- **实时性**：真实游戏是 60fps 实时运行，Agent 决策慢于 60Hz 时游戏不会等它。
   所以真实后端请优先用宏动作（`dodge` / `move_to` / `frames` 较大的 `step`），
   或先用 mock 把策略与奖励调好再上真机。
 - **菜单导航是 best-effort**：`menu_sequence` 中的方向键次数是估计值
@@ -736,7 +736,7 @@ powershell -ExecutionPolicy Bypass -File .\run_pipeline.ps1 -NoReal -Rounds 2 -R
 
 ## 11. 约定与致谢
 
-- th11 的内存偏移来自你已有的 `D:\东方AI实时分析\th11.py`（pymem 版本），
+- th11 的内存偏移取自本项目自用的 `D:\东方AI实时分析\th11.py`（pymem 版本，未随仓库分发），
   本项目中改为纯 ctypes 实现（同时支持 64 位 Python 读 32 位游戏）。
 - 覆盖层 DLL / 共享内存方案（`E:\TouhouOverlay`、`E:\thManager\TouHouManager\overlay`）
   本 MCP 未使用——MCP 走 stdio 返回图片，不往游戏里画东西。
