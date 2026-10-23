@@ -179,6 +179,13 @@ def main() -> int:
                          "(attack = 攻击意识: 分数有分量、危险度降为微调、存活惩罚不变)")
     ap.add_argument("--score-scale", type=float, default=None,
                     help="临时覆盖 reward.score_scale (不填则用 profile / config 的值)")
+    ap.add_argument("--progress-scale", type=float, default=None,
+                    help="临时覆盖 reward.progress_scale。**改奖励时一次只动这一个旋钮**: "
+                         "multi 档里 progress(6, 整条血仅 6 分) 与 alive(0.3×600步≈180) 差 30 倍, "
+                         "是 PPO 每轮都苟化的根因")
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="每 N 局存一份快照到 <out>/snapshots/policy_NNNN.npz (+meta.json)。"
+                         "0=关。用它在训练后按 6 弹型全评测选最优, 而不是靠 mean_ret 撞运气")
     ap.add_argument("--no-focus", dest="focus", action="store_false",
                     help="不加低速(focus)动作 (默认加)")
     ap.add_argument("--no-invincible", dest="invincible", action="store_false",
@@ -234,6 +241,9 @@ def main() -> int:
         log(f"[full] reward profile = {args.reward_profile}")
     if args.score_scale is not None:
         cfg.patch({"reward": {"score_scale": args.score_scale}})
+    if args.progress_scale is not None:
+        cfg.patch({"reward": {"progress_scale": args.progress_scale}})
+        log(f"[full] override progress_scale = {args.progress_scale}")
     reward = dict(cfg.section("reward"))
     env = TouhouEnv(cfg, registry=GameRegistry())
     env.start()
@@ -346,6 +356,7 @@ def main() -> int:
     trainer.start()
     best = (-1, -1, -1e9)
     last_eval = last_log = 0
+    last_snap = 0
     first_clear = None
     while len(trainer.episodes) < args.episodes and trainer.running:
         time.sleep(0.5)
@@ -360,6 +371,32 @@ def main() -> int:
                 })
             except Exception:
                 pass
+        if args.snapshot_every and n - last_snap >= args.snapshot_every and n > 0:
+            last_snap = n
+            try:
+                snap_dir = out / "snapshots"
+                trainer.save(snap_dir / f"policy_{n:04d}")
+                recent = trainer.episodes[-50:]
+                meta = {
+                    "episode": n,
+                    "steps_mean50": round(sum(e.steps for e in recent) / max(1, len(recent)), 1),
+                    "damage_mean50": round(
+                        sum(e.boss_damage for e in recent) / max(1, len(recent)), 1),
+                    "misses_mean50": round(
+                        sum(e.misses for e in recent) / max(1, len(recent)), 2),
+                    "align_mean50": round(
+                        sum((e.align_ratio or 0.0) for e in recent) / max(1, len(recent)), 3),
+                    "top_mean50": round(
+                        sum((getattr(e, "top_ratio", 0.0) or 0.0) for e in recent)
+                        / max(1, len(recent)), 3),
+                }
+                (snap_dir / f"policy_{n:04d}.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                log(f"[full] 快照 @ep{n}: 存活{meta['steps_mean50']:.0f} "
+                    f"伤害{meta['damage_mean50']:.0f} 对准{meta['align_mean50']:.0%} "
+                    f"-> {snap_dir / ('policy_%04d.npz' % n)}")
+            except Exception as exc:  # 快照失败不该中断训练
+                log(f"[full] !!! 快照失败 @ep{n}: {exc}")
         if n - last_eval >= args.eval_every and n > 0:
             last_eval = n
             (clears, stage, mean_ret, mean_steps, mean_dmg, mean_align, mean_score,
